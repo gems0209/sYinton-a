@@ -155,8 +155,9 @@ main {
   letter-spacing: 0.08em;
   color: var(--text);
   line-height: 1.9;
+  text-transform: uppercase; /* copy stays sentence-case in i18n, caps via CSS */
 }
-.help-body p.dim { margin-top: 0.4rem; text-transform: none; font-size: 0.72rem; color: var(--disabled); }
+.help-body p.dim { margin-top: 0.4rem; color: var(--disabled); }
 
 /* ------------------------------------------------------------------ home */
 .home-blocks { display: flex; flex-direction: column; }
@@ -322,6 +323,47 @@ main {
   background: var(--text); /* dirty white */
 }
 .time-line { font-size: 0.7rem; color: var(--text2); letter-spacing: 0.15em; text-align: right; }
+
+/* ------------------------------------------------------------------ queue */
+.queue-panel { border: 1px solid var(--border); }
+.queue-head { padding: 0.7rem 1rem; border-bottom: 1px solid var(--border); }
+.queue-list { list-style: none; }
+.queue-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.55rem 1rem;
+  border-bottom: 1px solid var(--surface);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  min-height: 44px;
+}
+.queue-row:last-child { border-bottom: none; }
+.queue-row.active { background: var(--text); color: #000; } /* inversion, not color */
+.q-mark { width: 1em; flex: none; }
+.q-num { color: var(--disabled); flex: none; }
+.queue-row.active .q-num { color: #000; }
+.q-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.q-state { color: var(--disabled); flex: none; }
+.q-dur { color: var(--text2); flex: none; }
+.queue-row.active .q-dur { color: #000; }
+.q-controls { display: flex; gap: 0.3rem; flex: none; }
+.q-controls button {
+  width: 44px; height: 36px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: inherit;
+  cursor: pointer;
+  font-size: 0.8rem;
+  transition: background 80ms linear, color 80ms linear;
+}
+.queue-row.active .q-controls button { border-color: #000; }
+.q-controls button:hover:not(:disabled) { background: var(--white); color: #000; }
+.queue-row.active .q-controls button:hover:not(:disabled) { background: #000; color: var(--white); }
+.q-controls button:disabled { color: var(--disabled); border-color: var(--surface); cursor: default; }
+
+/* repeat / shuffle active = inversion */
+#btn-repeat.on, #btn-shuffle.on { background: var(--white); color: #000; border-color: var(--white); }
 
 .techline {
   font-size: 0.65rem;

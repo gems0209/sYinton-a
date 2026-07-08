@@ -33,10 +33,14 @@ const S = {
   clientId: getClientId(),
   role: null,          // 'lead' | 'satellite'
   code: null,
-  track: null,         // { name, duration }
+  queue: [],           // [{id, name, duration, size}]
+  currentTrackId: null,
+  nextTrackId: null,
+  prefetch: [],        // track ids the server wants decoded on this device
+  repeatMode: 'off',
+  shuffle: false,
   playback: { status: 'idle' },
   peers: [],
-  loading: false,      // this client is downloading/decoding
   wakeLock: null,
   forceTimer: null,
 };
@@ -70,14 +74,14 @@ waves.bottom.start();
 const VIEWS = ['home', 'lead', 'sat', 'debug'];
 function showView(name) {
   for (const v of VIEWS) {
-    const el = $(`view-${v === 'sat' ? 'sat' : v}`);
-    el.hidden = v !== name;
+    $(`view-${v}`).hidden = v !== name;
   }
   waves.home[name === 'home' ? 'start' : 'stop']();
   waves.sat[name === 'sat' ? 'start' : 'stop']();
   if (name === 'home') {
     S.role = null;
     S.code = null;
+    bufferCache.clear();
     safeRemove(sessionStorage, 'wavepool-session');
     if (location.pathname !== '/debug') history.replaceState(null, '', '/');
   }
@@ -103,10 +107,14 @@ function fmtMs(ms) {
   return `${sign}${String(Math.round(Math.abs(ms))).padStart(3, '0')}MS`;
 }
 
+function currentTrack() {
+  return S.queue.find((q) => q.id === S.currentTrackId) || null;
+}
+
 // ------------------------------------------------------------- arm overlay --
 // AudioContext starts suspended (autoplay policy). We arm inside the CREATE /
 // JOIN tap when possible; the overlay covers flows with no usable gesture
-// (auto-rejoin after reload) and iOS edge cases.
+// (auto-join from a shared URL, reload) and iOS edge cases.
 let armPending = null;
 $('arm-overlay').addEventListener('click', async () => {
   const armed = await player.arm();
@@ -137,9 +145,12 @@ function armThen(fn) {
 // if a gesture is needed) and re-schedules from the authoritative timeline.
 function ensurePlaying() {
   if (!S.code || S.playback.status !== 'playing' || S.playback.click) return;
-  if (S.loading || player.playing || !player.buffer) return;
+  if (player.playing) return;
+  const buf = bufferCache.get(S.currentTrackId);
+  if (!buf) return; // still downloading/decoding — retried after decode
   armThen(() => {
     if (S.playback.status === 'playing' && !player.playing) {
+      player.setBuffer(buf);
       schedulePlayback(S.playback.startAtServerTime, S.playback.trackOffset, false);
     }
   });
@@ -150,8 +161,7 @@ async function requestWakeLock() {
     S.wakeLock = await navigator.wakeLock.request('screen');
     $('keep-screen').hidden = true;
   } catch {
-    // Fallback: tell the user to keep the screen on.
-    $('keep-screen').hidden = false;
+    $('keep-screen').hidden = false; // fallback: keep the screen on manually
   }
 }
 
@@ -164,6 +174,7 @@ onLangChange(() => {
   renderPeers();
   renderStatus();
   renderTrack();
+  renderQueue();
   $('net-status').textContent = ws.open ? t('connected') : t('reconnecting');
 });
 
@@ -228,7 +239,6 @@ ws.on('_open', async () => {
   // Join priority: shared URL (/5CEG) wins over a previously saved session.
   const target = urlSessionCode() || safeGet(sessionStorage, 'wavepool-session');
   if (target && !S.code) {
-    // Auto-join — needs the arm overlay (no usable gesture on page load).
     armThen(() => ws.send({ type: 'join', sessionCode: target, clientId: S.clientId }));
   } else if (S.code) {
     ws.send({ type: 'join', sessionCode: S.code, clientId: S.clientId });
@@ -240,7 +250,7 @@ ws.on('created', (msg) => {
 });
 
 ws.on('joined', (msg) => {
-  enterSession(msg.sessionCode, msg.role, msg.track, msg.playback, msg.peers);
+  enterSession(msg.sessionCode, msg.role, msg.queue, msg.playback, msg.peers);
 });
 
 ws.on('error', (msg) => {
@@ -264,30 +274,30 @@ ws.on('peer-update', (msg) => {
   renderPeers();
 });
 
-ws.on('track-loaded', (msg) => {
-  S.track = { name: msg.trackName, duration: null };
-  S.playback = { status: 'idle' };
-  player.stopLocal();
-  player.lastPos = 0;
-  loadTrack(msg.url);
-  renderTrack();
-  renderStatus();
+ws.on('queue-update', (msg) => {
+  applyQueueUpdate(msg);
 });
 
-ws.on('play', (msg) => {
-  S.playback = { status: 'playing', click: msg.click, startAtServerTime: msg.startAtServerTime, trackOffset: msg.trackOffset };
-  schedulePlayback(msg.startAtServerTime, msg.trackOffset, !!msg.click);
+// Track change (queue advance, skip, seek, play): the server fixed the start
+// instant; swap the buffer and schedule. The outgoing source keeps playing
+// until the handover (gapless).
+ws.on('track-change', (msg) => {
+  S.playback = {
+    status: 'playing',
+    click: msg.click,
+    startAtServerTime: msg.startAtServerTime,
+    trackOffset: msg.trackOffset,
+  };
+  if (!msg.click) S.currentTrackId = msg.trackId;
+  const buf = msg.click ? null : bufferCache.get(msg.trackId);
+  if (msg.click || buf) {
+    if (buf) player.setBuffer(buf);
+    schedulePlayback(msg.startAtServerTime, msg.trackOffset, !!msg.click);
+  }
+  // else: still decoding — ensurePlaying() fires after the decode completes.
   renderStatus();
+  renderQueue();
 });
-
-// Schedule against the shared clock; if the clock is not synced yet (play can
-// race the first burst), sync first. Then ask for an immediate authoritative
-// position so any residual error is corrected now, not at the next 5 s beat.
-async function schedulePlayback(startAtServerTime, trackOffset, click) {
-  if (!clock.synced) await clock.burst(10);
-  player.scheduleAt(startAtServerTime, trackOffset, click);
-  if (!click) ws.send({ type: 'position-request', sessionCode: S.code });
-}
 
 ws.on('pause', (msg) => {
   S.playback = { status: 'paused', position: msg.position };
@@ -315,16 +325,72 @@ ws.on('session-ended', () => {
   flash(t('session_ended'));
 });
 
+// Schedule against the shared clock; if the clock is not synced yet (play can
+// race the first burst), sync first. Then ask for an immediate authoritative
+// position so any residual error is corrected now, not at the next 5 s beat.
+async function schedulePlayback(startAtServerTime, trackOffset, click) {
+  if (!clock.synced) await clock.burst(10);
+  player.scheduleAt(startAtServerTime, trackOffset, click);
+  if (!click) ws.send({ type: 'position-request', sessionCode: S.code });
+}
+
+// -------------------------------------------------------- queue / prefetch --
+// Decoded AudioBuffers are heavy (~10 MB/min): keep at most the tracks the
+// server asks for (current + next, shuffle/repeat already resolved) and drop
+// the rest when the queue moves on.
+const bufferCache = new Map(); // trackId -> AudioBuffer
+const decoding = new Set();
+
+function applyQueueUpdate(msg) {
+  S.queue = msg.queue;
+  S.currentTrackId = msg.currentTrackId;
+  S.nextTrackId = msg.nextTrackId;
+  S.prefetch = msg.prefetch || [];
+  S.repeatMode = msg.repeatMode;
+  S.shuffle = msg.shuffle;
+  renderQueue();
+  renderTrack();
+  renderStatus();
+  ensureBuffers();
+}
+
+async function ensureBuffers() {
+  if (!S.code) return;
+  const want = new Set(S.prefetch);
+  for (const id of [...bufferCache.keys()]) {
+    if (!want.has(id)) bufferCache.delete(id); // free memory as the queue moves
+  }
+  for (const id of want) {
+    if (bufferCache.has(id) || decoding.has(id)) continue;
+    decoding.add(id);
+    renderQueue();
+    try {
+      player.init();
+      const buf = await player.decode(`/audio/${S.code}/${id}`);
+      decoding.delete(id);
+      if (!S.prefetch.includes(id)) continue; // queue moved meanwhile
+      bufferCache.set(id, buf);
+      ws.send({ type: 'client-ready', sessionCode: S.code, trackId: id, duration: buf.duration });
+      renderQueue();
+      renderTrack();
+      ensurePlaying(); // late join / track-change that was waiting on this decode
+    } catch (err) {
+      decoding.delete(id);
+      flash(`ERR: ${String(err.message).toUpperCase()}`);
+    }
+  }
+  renderStatus();
+}
+
 // ----------------------------------------------------------- session flow --
-function enterSession(code, role, track, playback, peers) {
+function enterSession(code, role, queueSnapshot, playback, peers) {
   S.code = code;
   S.role = role;
   S.peers = peers || [];
-  S.track = track ? { name: track.name, duration: track.duration } : null;
   S.playback = playback || { status: 'idle' };
   safeSet(sessionStorage, 'wavepool-session', code);
-  // The address bar becomes the invite: copy/share the URL and whoever opens
-  // it joins this session as a satellite.
+  // The address bar becomes the invite: share the URL and whoever opens it
+  // joins this session as a satellite.
   history.replaceState(null, '', `/${code}`);
 
   if (role === 'lead') {
@@ -334,15 +400,14 @@ function enterSession(code, role, track, playback, peers) {
     $('sat-code').textContent = code;
     showView('sat');
   }
+  if (queueSnapshot) applyQueueUpdate(queueSnapshot);
+  else { S.queue = []; S.currentTrackId = null; S.nextTrackId = null; S.prefetch = []; renderQueue(); }
+  if (playback && playback.status === 'paused') player.lastPos = playback.position || 0;
   renderPeers();
   renderTrack();
   renderStatus();
   requestWakeLock();
-
-  if (track) {
-    // Late join: download + decode, then sync into the running playback.
-    loadTrack(track.url, playback);
-  }
+  // Late join into running playback: handled by ensureBuffers → ensurePlaying.
 }
 
 function leaveSession() {
@@ -354,31 +419,6 @@ function leaveSession() {
 $('btn-leave-lead').addEventListener('click', leaveSession);
 $('btn-leave-sat').addEventListener('click', leaveSession);
 
-async function loadTrack(url, playbackAfter = null) {
-  S.loading = true;
-  renderStatus();
-  try {
-    const duration = await player.load(url);
-    if (S.track) S.track.duration = duration;
-    S.loading = false;
-    ws.send({ type: 'client-ready', sessionCode: S.code, duration });
-    renderTrack();
-    renderStatus();
-    // Late join into a running track: compute current position from the
-    // shared clock and start immediately at the right point.
-    const pb = playbackAfter || S.playback;
-    if (pb.status === 'playing' && !pb.click) {
-      schedulePlayback(pb.startAtServerTime, pb.trackOffset, false);
-    } else if (pb.status === 'paused') {
-      player.lastPos = pb.position || 0;
-    }
-  } catch (err) {
-    S.loading = false;
-    flash(`ERR: ${err.message.toUpperCase()}`);
-    renderStatus();
-  }
-}
-
 // ------------------------------------------------------------------ lead ---
 const fileInput = $('file-input');
 const dropzone = $('dropzone');
@@ -389,39 +429,58 @@ dropzone.addEventListener('dragleave', () => dropzone.classList.remove('over'));
 dropzone.addEventListener('drop', (e) => {
   e.preventDefault();
   dropzone.classList.remove('over');
-  if (e.dataTransfer.files[0]) uploadFile(e.dataTransfer.files[0]);
+  if (e.dataTransfer.files.length) uploadFiles([...e.dataTransfer.files]);
 });
 fileInput.addEventListener('change', () => {
-  if (fileInput.files[0]) uploadFile(fileInput.files[0]);
+  if (fileInput.files.length) uploadFiles([...fileInput.files]);
   fileInput.value = '';
 });
 
-async function uploadFile(file) {
-  if (file.size > 60 * 1024 * 1024) { flash(t('err_upload')); return; }
-  const ext = (file.name.split('.').pop() || '').toLowerCase();
-  if (!['mp3', 'wav', 'ogg', 'm4a', 'flac'].includes(ext)) { flash(t('err_upload')); return; }
-  $('drop-label').textContent = t('uploading');
-  try {
-    const fd = new FormData();
-    fd.append('audio', file);
-    const res = await fetch(`/upload/${S.code}`, { method: 'POST', body: fd });
-    if (!res.ok) throw new Error((await res.json()).error || 'UPLOAD');
-    // server broadcasts track-loaded (to us too)
-  } catch (err) {
-    flash(`ERR: ${String(err.message).toUpperCase()}`);
+// Multi-file upload: sequential (keeps the selection order in the queue), one
+// invalid file is skipped with a message without blocking the others. Tracks
+// can be added at any time — the queue keeps playing.
+async function uploadFiles(files) {
+  let n = 0;
+  for (const file of files) {
+    n++;
+    const ext = (file.name.split('.').pop() || '').toLowerCase();
+    if (file.size > 60 * 1024 * 1024 || !['mp3', 'wav', 'ogg', 'm4a', 'flac'].includes(ext)) {
+      flash(`${t('err_upload')} — ${file.name.toUpperCase()}`);
+      continue;
+    }
+    $('drop-label').textContent = `${t('uploading')} ${n}/${files.length}`;
+    try {
+      const fd = new FormData();
+      fd.append('audio', file);
+      const res = await fetch(`/upload/${S.code}`, { method: 'POST', body: fd });
+      if (!res.ok) throw new Error((await res.json()).error || 'UPLOAD');
+      // server broadcasts queue-update (to us too)
+    } catch (err) {
+      flash(`ERR: ${String(err.message).toUpperCase()} — ${file.name.toUpperCase()}`);
+    }
   }
   $('drop-label').textContent = t('drop');
 }
 
 $('btn-play').addEventListener('click', () => {
-  const pos = S.playback.status === 'paused' ? (S.playback.position || 0) : player.idealPosition();
-  ws.send({ type: 'play', sessionCode: S.code, position: S.playback.status === 'idle' ? 0 : pos });
+  const pos = S.playback.status === 'paused' ? (S.playback.position || 0) : 0;
+  ws.send({ type: 'play', sessionCode: S.code, position: pos });
 });
 $('btn-force').addEventListener('click', () => {
   ws.send({ type: 'play', sessionCode: S.code, position: 0, force: true });
 });
 $('btn-pause').addEventListener('click', () => ws.send({ type: 'pause', sessionCode: S.code }));
 $('btn-stop').addEventListener('click', () => ws.send({ type: 'stop', sessionCode: S.code }));
+$('btn-prev').addEventListener('click', () => ws.send({ type: 'skip-prev', sessionCode: S.code }));
+$('btn-next').addEventListener('click', () => ws.send({ type: 'skip-next', sessionCode: S.code }));
+
+$('btn-repeat').addEventListener('click', () => {
+  const next = { off: 'all', all: 'one', one: 'off' }[S.repeatMode] || 'off';
+  ws.send({ type: 'set-repeat', sessionCode: S.code, mode: next });
+});
+$('btn-shuffle').addEventListener('click', () => {
+  ws.send({ type: 'set-shuffle', sessionCode: S.code, on: !S.shuffle });
+});
 
 $('btn-click').addEventListener('click', () => {
   if (S.playback.click) {
@@ -433,19 +492,24 @@ $('btn-click').addEventListener('click', () => {
 
 const progress = $('progress');
 progress.addEventListener('click', (e) => {
-  if (S.role !== 'lead' || !S.track || !S.track.duration) return;
+  const track = currentTrack();
+  if (S.role !== 'lead' || !track || !track.duration) return;
   const r = progress.getBoundingClientRect();
   const frac = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
-  ws.send({ type: 'seek', sessionCode: S.code, position: frac * S.track.duration });
+  ws.send({ type: 'seek', sessionCode: S.code, position: frac * track.duration });
 });
 
 // ------------------------------------------------------------- rendering ---
 function statusKey() {
-  if (S.loading) return 'st_loading';
   if (S.playback.click) return 'st_click';
-  if (S.playback.status === 'playing') return 'st_playing';
+  if (S.playback.status === 'playing') {
+    // Playing per the server but this device hasn't decoded the track yet.
+    if (!S.playback.click && !bufferCache.get(S.currentTrackId)) return 'st_buffering';
+    return 'st_playing';
+  }
   if (S.playback.status === 'paused') return 'st_paused';
-  if (S.role === 'satellite' && !S.track) return 'st_waiting';
+  if (decoding.size > 0) return 'st_loading';
+  if (S.role === 'satellite' && S.queue.length === 0) return 'st_waiting';
   return 'st_idle';
 }
 
@@ -454,8 +518,7 @@ function renderStatus() {
   $('lead-status').textContent = st;
   $('sat-status').textContent = st;
   const playing = S.playback.status === 'playing';
-  $('sat-waiting').hidden = !(S.role === 'satellite' && !playing && !S.track);
-  // waves react to real audio while playing, ambient motion otherwise
+  $('sat-waiting').hidden = !(S.role === 'satellite' && !playing && S.queue.length === 0);
   const an = playing ? player.analyser : null;
   waves.sat.setAnalyser(an);
   waves.top.setAnalyser(an);
@@ -463,10 +526,10 @@ function renderStatus() {
 }
 
 function renderTrack() {
-  $('lead-track').textContent = S.track ? S.track.name.toUpperCase() : t('no_track');
-  $('sat-track').textContent = S.track ? S.track.name.toUpperCase() : '';
-  $('time-dur').textContent = fmtTime(S.track?.duration || 0);
-  updateTransport();
+  const track = currentTrack();
+  $('lead-track').textContent = track ? track.name.toUpperCase() : t('no_track');
+  $('sat-track').textContent = track ? track.name.toUpperCase() : '';
+  $('time-dur').textContent = fmtTime(track?.duration || 0);
 }
 
 function allReady() {
@@ -482,7 +545,7 @@ function renderPeers() {
     const li = document.createElement('li');
     const who = p.role === 'lead' ? t('lead') : t('satellite');
     const me = p.id === S.clientId ? ` [${t('you')}]` : '';
-    const state = !p.connected ? '· · ·' : (p.ready ? t('st_ready') : (S.track ? t('st_loading') : '—'));
+    const state = !p.connected ? '· · ·' : (p.ready ? t('st_ready') : (S.queue.length ? t('st_loading') : '—'));
     li.innerHTML = `<span>${who} ${p.id.slice(0, 4).toUpperCase()}${me}</span><span class="${p.ready ? 'ready' : 'dim'}">${state}</span>`;
     if (!p.connected) li.classList.add('dim');
     ul.appendChild(li);
@@ -490,20 +553,76 @@ function renderPeers() {
   updateTransport();
 }
 
-// Lead transport gating: PLAY only when every connected client is ready;
-// after 10 s of waiting, expose PLAY ANYWAY.
+// Queue panel: lead gets reorder/remove controls, satellites read-only.
+// ▶ marks the playing track, › the next one (shuffle/repeat already resolved
+// by the server).
+function renderQueue() {
+  for (const listId of ['queue-list', 'sat-queue-list']) {
+    const ul = $(listId);
+    if (!ul) continue;
+    const isLead = listId === 'queue-list' && S.role === 'lead';
+    ul.innerHTML = '';
+    S.queue.forEach((track, i) => {
+      const li = document.createElement('li');
+      li.className = 'queue-row';
+      if (track.id === S.currentTrackId) li.classList.add('active');
+      const mark = track.id === S.currentTrackId ? '▶' : (track.id === S.nextTrackId ? '›' : '');
+      const state = bufferCache.has(track.id) ? '' : (decoding.has(track.id) ? '…' : '');
+      const dur = track.duration ? fmtTime(track.duration) : '--:--';
+      li.innerHTML =
+        `<span class="q-mark">${mark}</span>` +
+        `<span class="q-num num">${String(i + 1).padStart(2, '0')}</span>` +
+        `<span class="q-name">${track.name.toUpperCase()}</span>` +
+        `<span class="q-state">${state}</span>` +
+        `<span class="q-dur num">${dur}</span>`;
+      if (isLead) {
+        const controls = document.createElement('span');
+        controls.className = 'q-controls';
+        const mk = (label, aria, fn, disabled = false) => {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.textContent = label;
+          b.setAttribute('aria-label', aria);
+          b.disabled = disabled;
+          b.addEventListener('click', fn);
+          controls.appendChild(b);
+        };
+        mk('↑', 'up', () => ws.send({ type: 'queue-reorder', sessionCode: S.code, from: i, to: i - 1 }), i === 0);
+        mk('↓', 'down', () => ws.send({ type: 'queue-reorder', sessionCode: S.code, from: i, to: i + 1 }), i === S.queue.length - 1);
+        mk('✕', 'remove', () => ws.send({ type: 'queue-remove', sessionCode: S.code, trackId: track.id }));
+        li.appendChild(controls);
+      }
+      ul.appendChild(li);
+    });
+  }
+  const count = `${String(S.queue.length).padStart(2, '0')}`;
+  $('queue-count').textContent = count;
+  $('sat-queue-count').textContent = count;
+  $('queue-panel').hidden = S.queue.length === 0;
+  $('sat-queue-panel').hidden = S.queue.length === 0;
+  updateTransport();
+}
+
+// Lead transport gating: PLAY only when every connected client has decoded
+// the track it would start; after 10 s of waiting, expose PLAY ANYWAY.
 function updateTransport() {
   if (S.role !== 'lead') return;
-  const hasTrack = !!S.track && !S.loading;
-  const ready = hasTrack && allReady();
+  const hasQueue = S.queue.length > 0;
+  const ready = hasQueue && allReady();
   $('btn-play').disabled = !ready || S.playback.status === 'playing';
   $('btn-pause').disabled = S.playback.status !== 'playing' || !!S.playback.click;
   $('btn-stop').disabled = S.playback.status === 'idle';
+  $('btn-prev').disabled = !hasQueue || !!S.playback.click;
+  $('btn-next').disabled = !hasQueue || !!S.playback.click;
+  $('btn-repeat').textContent = `${t('repeat')}: ${t('rep_' + S.repeatMode)}`;
+  $('btn-repeat').classList.toggle('on', S.repeatMode !== 'off');
+  $('btn-shuffle').textContent = `${t('shuffle')}: ${S.shuffle ? t('on') : t('off')}`;
+  $('btn-shuffle').classList.toggle('on', S.shuffle);
   $('btn-click').textContent = S.playback.click ? t('click_stop') : t('click_start');
   $('click-hint').hidden = !S.playback.click;
 
   clearTimeout(S.forceTimer);
-  if (hasTrack && !ready) {
+  if (hasQueue && !ready) {
     S.forceTimer = setTimeout(() => { $('btn-force').hidden = false; }, 10000);
   } else {
     $('btn-force').hidden = true;
@@ -530,10 +649,11 @@ setInterval(() => {
       stallTicks = 0;
     }
   }
-  if (S.role === 'lead' && S.track?.duration) {
+  const track = currentTrack();
+  if (S.role === 'lead' && track?.duration) {
     const pos = S.playback.status === 'playing' ? player.idealPosition()
       : (S.playback.status === 'paused' ? (S.playback.position || 0) : player.lastPos);
-    const frac = Math.min(1, Math.max(0, pos / S.track.duration));
+    const frac = Math.min(1, Math.max(0, pos / track.duration));
     $('progress-fill').style.width = `${frac * 100}%`;
     progress.setAttribute('aria-valuenow', Math.round(frac * 100));
     $('time-cur').textContent = fmtTime(pos);
@@ -544,12 +664,11 @@ setInterval(() => {
 // The app exhibits its own mechanics, like VU meters on a mixer.
 function renderTech() {
   if (!S.code) return;
-  const parts = [
+  const line = [
     `OFFSET: ${fmtMs(clock.offset)}`,
     `RTT: ${Math.round(clock.medianRtt)}MS`,
     `DRIFT: ${fmtMs(player.lastDrift * 1000)}`,
-  ];
-  const line = parts.join(' · ');
+  ].join(' · ');
   $('lead-tech').textContent = line;
   $('sat-tech').textContent = line;
 }

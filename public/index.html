@@ -92,20 +92,31 @@
       <div class="dropzone" id="dropzone" role="button" tabindex="0">
         <span id="drop-label" data-i18n="drop">TRASCINA IL FILE QUI — O TOCCA</span>
         <span class="dim" data-i18n="drop_hint"></span>
-        <input type="file" id="file-input" accept=".mp3,.wav,.ogg,.m4a,.flac,audio/*" hidden>
+        <input type="file" id="file-input" accept=".mp3,.wav,.ogg,.m4a,.flac,audio/*" multiple hidden>
       </div>
 
       <div class="transport">
+        <button type="button" id="btn-prev" aria-label="previous" disabled>⏮</button>
         <button type="button" id="btn-play" data-i18n="play" disabled>PLAY</button>
         <button type="button" id="btn-pause" data-i18n="pause" disabled>PAUSE</button>
         <button type="button" id="btn-stop" data-i18n="stop" disabled>STOP</button>
+        <button type="button" id="btn-next" aria-label="next" disabled>⏭</button>
         <button type="button" id="btn-force" class="ghost" data-i18n="play_anyway" hidden>AVVIA COMUNQUE</button>
+      </div>
+      <div class="transport">
+        <button type="button" id="btn-repeat">REPEAT: OFF</button>
+        <button type="button" id="btn-shuffle">SHUFFLE: OFF</button>
       </div>
 
       <div class="progress" id="progress" role="slider" aria-label="seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" tabindex="0">
         <div class="progress-fill" id="progress-fill"></div>
       </div>
       <div class="time-line num"><span id="time-cur">00:00</span> / <span id="time-dur">00:00</span></div>
+
+      <div class="queue-panel" id="queue-panel" hidden>
+        <div class="queue-head label"><span data-i18n="queue_title">CODA</span>: <span id="queue-count" class="num">00</span></div>
+        <ul class="queue-list" id="queue-list"></ul>
+      </div>
 
       <div class="spec-row">
         <button type="button" id="btn-click" class="ghost" data-i18n="click_start">CLICK TRACK</button>
@@ -132,6 +143,11 @@
 
       <canvas class="wave wave-sat" id="wave-sat" aria-hidden="true"></canvas>
       <div class="sat-waiting label" id="sat-waiting" data-i18n="st_waiting">IN ATTESA DEL LEAD</div>
+
+      <div class="queue-panel" id="sat-queue-panel" hidden>
+        <div class="queue-head label"><span data-i18n="queue_title">CODA</span>: <span id="sat-queue-count" class="num">00</span></div>
+        <ul class="queue-list" id="sat-queue-list"></ul>
+      </div>
 
       <div class="sliders">
         <div class="slider-row">

@@ -14,13 +14,12 @@ const { now, handleTimesync } = require('./timesync');
 
 const PORT = process.env.PORT || 3000;
 const ROOT = path.join(__dirname, '..');
-const UPLOAD_DIR = path.join(ROOT, 'uploads');
-const MAX_UPLOAD = 60 * 1024 * 1024; // 60 MB
+const MAX_UPLOAD = 60 * 1024 * 1024; // 60 MB per file
 
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-// Orphaned files from a previous run (state is in-memory, so they're all stale).
-for (const f of fs.readdirSync(UPLOAD_DIR)) {
-  if (!f.startsWith('.')) fs.unlink(path.join(UPLOAD_DIR, f), () => {}); // keep .gitkeep
+fs.mkdirSync(S.UPLOAD_ROOT, { recursive: true });
+// Orphaned files/dirs from a previous run (state is in-memory, all stale).
+for (const f of fs.readdirSync(S.UPLOAD_ROOT)) {
+  if (!f.startsWith('.')) fs.rm(path.join(S.UPLOAD_ROOT, f), { recursive: true, force: true }, () => {}); // keep .gitkeep
 }
 
 const app = express();
@@ -35,8 +34,16 @@ const ALLOWED_EXT = new Set(['.mp3', '.wav', '.ogg', '.m4a', '.flac']);
 
 const upload = multer({
   storage: multer.diskStorage({
-    destination: UPLOAD_DIR,
-    filename: (_req, _file, cb) => cb(null, crypto.randomBytes(12).toString('hex')),
+    destination: (req, _file, cb) => {
+      const session = S.get((req.params.sessionCode || '').toUpperCase());
+      if (!session) return cb(new Error('SESSION NOT FOUND'));
+      const dir = S.uploadDir(session);
+      fs.mkdir(dir, { recursive: true }, (err) => cb(err, dir));
+    },
+    filename: (_req, file, cb) => {
+      const id = crypto.randomBytes(6).toString('hex');
+      cb(null, id + path.extname(file.originalname || '').toLowerCase());
+    },
   }),
   limits: { fileSize: MAX_UPLOAD },
   fileFilter: (_req, file, cb) => {
@@ -58,6 +65,8 @@ function sniffAudio(buf) {
   return null;
 }
 
+// One file per request; the client loops for multi-select. Each valid file is
+// APPENDED to the queue — adding never interrupts playback.
 app.post('/upload/:sessionCode', upload.single('audio'), (req, res) => {
   const session = S.get((req.params.sessionCode || '').toUpperCase());
   const file = req.file;
@@ -81,27 +90,28 @@ app.post('/upload/:sessionCode', upload.single('audio'), (req, res) => {
     return res.status(400).json({ error: 'NOT AN AUDIO FILE' });
   }
 
-  // New file during playback → global stop, then a fresh load/ready cycle.
-  if (session.playback.status !== 'idle') {
-    session.playback = { status: 'idle', trackOffset: 0, startAtServerTime: 0, pausedPosition: 0, click: false };
-    S.broadcast(session, { type: 'stop' });
-  }
-  S.deleteTrackFile(session);
-  session.track = {
+  const track = {
+    id: path.basename(file.path, path.extname(file.path)),
     filePath: file.path,
     originalName: file.originalname,
     size: file.size,
     duration: null, // clients report it after decoding
+    addedAt: Date.now(),
   };
-  for (const c of session.clients.values()) c.ready = false;
+  session.queue.push(track);
+  if (session.shuffle) {
+    // Insert the new id at a random spot in the not-yet-played tail of the
+    // permutation so shuffle stays "fair" without re-rolling the whole order.
+    const order = session.shuffleOrder;
+    const cur = order.indexOf(session.currentTrackId);
+    const from = cur + 1;
+    const at = from + Math.floor(Math.random() * (order.length - from + 1));
+    order.splice(at, 0, track.id);
+  }
   S.touch(session);
-  S.broadcast(session, {
-    type: 'track-loaded',
-    trackName: session.track.originalName,
-    url: `/audio/${session.code}`,
-  });
-  S.broadcastPeers(session);
-  res.json({ ok: true, trackName: session.track.originalName });
+  S.broadcastQueue(session);
+  S.broadcastPeers(session); // gate track may have changed from null
+  res.json({ ok: true, trackId: track.id, trackName: track.originalName });
 });
 
 // Multer errors (file too large etc.) must not crash the server.
@@ -109,10 +119,11 @@ app.use((err, _req, res, _next) => {
   res.status(err.code === 'LIMIT_FILE_SIZE' ? 413 : 400).json({ error: err.message || 'UPLOAD ERROR' });
 });
 
-app.get('/audio/:sessionCode', (req, res) => {
+app.get('/audio/:sessionCode/:trackId', (req, res) => {
   const session = S.get((req.params.sessionCode || '').toUpperCase());
-  if (!session || !session.track) return res.status(404).end();
-  res.sendFile(session.track.filePath); // express handles Range requests
+  const track = session && S.getTrack(session, req.params.trackId);
+  if (!track) return res.status(404).end();
+  res.sendFile(track.filePath); // express handles Range requests
 });
 
 // ------------------------------------------------------------- websocket ----
@@ -126,27 +137,42 @@ function sendError(ws, code, text) {
   send(ws, { type: 'error', code, text });
 }
 
-// Scheduled play: fix a start instant far enough in the future that every
-// client has received the message and can schedule the exact same sample.
-function scheduledPlay(session, fromPosition, click = false) {
+// Scheduled start of a track: fix an instant far enough in the future that
+// every client can schedule the exact same sample. `leadMs` is normally the
+// standard 1.5 s; the auto-advance ticker passes the exact remaining time of
+// the outgoing track so the next one starts gaplessly when it ends.
+function startTrack(session, trackId, fromPosition = 0, leadMs = S.PLAY_LEAD_TIME_MS, click = false) {
+  session.currentTrackId = click ? session.currentTrackId : trackId;
+  session.advanceWaitSince = null;
   session.playback = {
     status: 'playing',
     trackOffset: fromPosition,
-    startAtServerTime: now() + S.PLAY_LEAD_TIME_MS,
+    startAtServerTime: now() + leadMs,
     pausedPosition: 0,
     click,
   };
   S.broadcast(session, {
-    type: 'play',
+    type: 'track-change',
+    trackId: click ? null : trackId,
     startAtServerTime: session.playback.startAtServerTime,
     trackOffset: fromPosition,
     click,
   });
+  if (!click) {
+    S.broadcastQueue(session); // current/next moved
+    S.broadcastPeers(session); // ready is relative to the (new) gate track
+  }
 }
 
-function allConnectedReady(session) {
+function stopPlayback(session, ended = false) {
+  session.playback = { status: 'idle', trackOffset: 0, startAtServerTime: 0, pausedPosition: 0, click: false };
+  session.advanceWaitSince = null;
+  S.broadcast(session, { type: 'stop', ended });
+}
+
+function allConnectedReadyFor(session, trackId) {
   for (const c of session.clients.values()) {
-    if (c.connected && !c.ready) return false;
+    if (c.connected && !c.readyFor.has(trackId)) return false;
   }
   return true;
 }
@@ -161,7 +187,9 @@ function attachClient(session, clientId, role, ws) {
     existing.disconnectedAt = null;
     return existing;
   }
-  const client = { id: clientId, role, ws, ready: false, connected: true, disconnectedAt: null, removeTimer: null };
+  const client = {
+    id: clientId, role, ws, readyFor: new Set(), connected: true, disconnectedAt: null, removeTimer: null,
+  };
   session.clients.set(clientId, client);
   return client;
 }
@@ -175,11 +203,11 @@ function handleDisconnect(ws) {
   if (!client || client.ws !== ws) return; // a newer socket already took over
 
   client.connected = false;
-  client.ready = false;
   client.disconnectedAt = Date.now();
 
   if (clientId === session.leadId) {
-    // Orphaned session: satellites keep playing; the lead has 60 s to return.
+    // Orphaned session: playback AND queue auto-advance keep going (the server
+    // is the authority); only the controls are missing. 60 s to come back.
     clearTimeout(session.orphanTimer);
     session.orphanTimer = setTimeout(() => {
       const c = session.clients.get(clientId);
@@ -227,9 +255,7 @@ const HANDLERS = {
       sessionCode: session.code,
       clientId: msg.clientId,
       role: isLead ? 'lead' : 'satellite',
-      track: session.track
-        ? { name: session.track.originalName, duration: session.track.duration, url: `/audio/${session.code}` }
-        : null,
+      queue: S.queueSnapshot(session),
       playback: S.playbackSnapshot(session),
       peers: S.peerList(session),
     });
@@ -237,51 +263,57 @@ const HANDLERS = {
   },
 
   'client-ready'(ws, msg, session, client) {
-    client.ready = true;
-    if (session.track && !session.track.duration && typeof msg.duration === 'number' && msg.duration > 0) {
-      session.track.duration = msg.duration;
+    const track = S.getTrack(session, msg.trackId);
+    if (!track) return;
+    client.readyFor.add(track.id);
+    let queueChanged = false;
+    if (!track.duration && typeof msg.duration === 'number' && msg.duration > 0) {
+      track.duration = msg.duration;
+      queueChanged = true;
     }
     S.broadcastPeers(session);
+    if (queueChanged) S.broadcastQueue(session);
   },
 
   // ---- transport: lead only. A satellite sending these is silently ignored.
   play(ws, msg, session, client) {
     if (client.role !== 'lead') return;
-    if (!session.track) return sendError(ws, 'NO_TRACK', 'NO TRACK LOADED');
-    if (!allConnectedReady(session) && msg.force !== true) {
+    const target = S.gateTrackId(session);
+    if (!target) return sendError(ws, 'NO_TRACK', 'QUEUE IS EMPTY');
+    if (!allConnectedReadyFor(session, target) && msg.force !== true) {
       return sendError(ws, 'NOT_READY', 'CLIENTS STILL LOADING');
     }
+    const track = S.getTrack(session, target);
     let from = typeof msg.position === 'number' ? Math.max(0, msg.position) : S.position(session);
-    // Resuming past the end of the track (paused after natural end): restart.
-    if (session.track.duration && from >= session.track.duration) from = 0;
-    scheduledPlay(session, from, false);
+    if (track.duration && from >= track.duration) from = 0; // resume past end → restart
+    startTrack(session, target, from);
   },
 
   pause(ws, msg, session, client) {
     if (client.role !== 'lead') return;
-    if (session.playback.status !== 'playing') return;
+    if (session.playback.status !== 'playing' || session.playback.click) return;
     let pos = S.position(session);
-    if (!session.playback.click && session.track && session.track.duration) {
-      pos = Math.min(pos, session.track.duration);
-    }
+    const track = S.currentTrack(session);
+    if (track && track.duration) pos = Math.min(pos, track.duration);
     session.playback = { status: 'paused', trackOffset: 0, startAtServerTime: 0, pausedPosition: pos, click: false };
+    session.advanceWaitSince = null;
     S.broadcast(session, { type: 'pause', position: pos });
   },
 
   stop(ws, msg, session, client) {
     if (client.role !== 'lead') return;
-    session.playback = { status: 'idle', trackOffset: 0, startAtServerTime: 0, pausedPosition: 0, click: false };
-    S.broadcast(session, { type: 'stop' });
+    stopPlayback(session);
   },
 
   seek(ws, msg, session, client) {
     if (client.role !== 'lead') return;
     if (typeof msg.position !== 'number') return;
+    const track = S.currentTrack(session);
+    if (!track) return;
     let pos = Math.max(0, msg.position);
-    if (session.track && session.track.duration) pos = Math.min(pos, session.track.duration - 0.05);
+    if (track.duration) pos = Math.min(pos, track.duration - 0.05);
     if (session.playback.status === 'playing' && !session.playback.click) {
-      // Seek = stop + new scheduled play from the target position.
-      scheduledPlay(session, pos, false);
+      startTrack(session, track.id, pos); // seek = stop + new scheduled play
     } else if (session.playback.status !== 'idle') {
       session.playback.pausedPosition = pos;
       session.playback.status = 'paused';
@@ -289,17 +321,85 @@ const HANDLERS = {
     }
   },
 
-  // Calibration click track — scheduled exactly like a normal track, but every
-  // client generates the click buffer locally (nothing to download).
+  'skip-next'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    const next = S.resolveNextId(session, { manual: true });
+    if (!next) return stopPlayback(session);
+    startTrack(session, next);
+  },
+
+  // Standard player convention: >3 s into the track, "prev" restarts it;
+  // otherwise it goes to the previous track.
+  'skip-prev'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    if (session.playback.status === 'playing' && S.position(session) > 3) {
+      return startTrack(session, session.currentTrackId);
+    }
+    const prev = S.resolvePrevId(session);
+    if (prev) startTrack(session, prev);
+  },
+
+  'queue-remove'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    const track = S.getTrack(session, msg.trackId);
+    if (!track) return;
+    const wasCurrent = track.id === session.currentTrackId;
+    const wasPlaying = session.playback.status === 'playing' && !session.playback.click;
+    // Resolve the successor BEFORE removal so repeat/shuffle order still sees
+    // the current position.
+    const next = wasCurrent ? S.resolveNextId(session, { manual: true }) : null;
+    session.queue = session.queue.filter((t) => t.id !== track.id);
+    session.shuffleOrder = session.shuffleOrder.filter((id) => id !== track.id);
+    S.deleteTrackFile(track);
+    if (wasCurrent) {
+      session.currentTrackId = null;
+      if (next && next !== track.id && wasPlaying) {
+        startTrack(session, next); // removing the playing track skips ahead
+        return;
+      }
+      if (wasPlaying || session.playback.status === 'paused') stopPlayback(session);
+    }
+    S.broadcastQueue(session);
+    S.broadcastPeers(session);
+  },
+
+  // Reorder never touches playback: the current track is referenced by id.
+  'queue-reorder'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    const { from, to } = msg;
+    const len = session.queue.length;
+    if (!Number.isInteger(from) || !Number.isInteger(to)) return;
+    if (from < 0 || from >= len || to < 0 || to >= len || from === to) return;
+    const [moved] = session.queue.splice(from, 1);
+    session.queue.splice(to, 0, moved);
+    S.broadcastQueue(session);
+  },
+
+  'set-repeat'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    if (!['off', 'all', 'one'].includes(msg.mode)) return;
+    session.repeatMode = msg.mode; // takes effect at the NEXT track change
+    S.broadcastQueue(session);
+  },
+
+  'set-shuffle'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    session.shuffle = !!msg.on;
+    if (session.shuffle) S.regenShuffle(session); // stable until toggled again
+    else session.shuffleOrder = [];
+    S.broadcastQueue(session); // current track is untouched, only "next" moves
+  },
+
+  // Calibration click track — generated locally by every client, scheduled
+  // like a normal track; the queue is untouched.
   'click-start'(ws, msg, session, client) {
     if (client.role !== 'lead') return;
-    scheduledPlay(session, 0, true);
+    startTrack(session, null, 0, S.PLAY_LEAD_TIME_MS, true);
   },
 
   'click-stop'(ws, msg, session, client) {
     if (client.role !== 'lead') return;
-    session.playback = { status: 'idle', trackOffset: 0, startAtServerTime: 0, pausedPosition: 0, click: false };
-    S.broadcast(session, { type: 'stop' });
+    stopPlayback(session);
   },
 
   // A client back from background asks where we are (faster than waiting for
@@ -327,7 +427,9 @@ const HANDLERS = {
 
 // Messages that only make sense inside a session.
 const SESSION_SCOPED = new Set([
-  'client-ready', 'play', 'pause', 'stop', 'seek', 'click-start', 'click-stop', 'position-request', 'leave',
+  'client-ready', 'play', 'pause', 'stop', 'seek',
+  'skip-next', 'skip-prev', 'queue-remove', 'queue-reorder', 'set-repeat', 'set-shuffle',
+  'click-start', 'click-stop', 'position-request', 'leave',
 ]);
 
 wss.on('connection', (ws) => {
@@ -347,7 +449,6 @@ wss.on('connection', (ws) => {
       if (SESSION_SCOPED.has(msg.type)) {
         const session = S.get(ws.meta.sessionCode);
         if (!session) return sendError(ws, 'NO_SESSION', 'NOT IN A SESSION');
-        // Every session message carries sessionCode; reject mismatches.
         if (msg.sessionCode && String(msg.sessionCode).toUpperCase() !== session.code) return;
         const client = session.clients.get(ws.meta.clientId);
         if (!client) return;
@@ -364,22 +465,50 @@ wss.on('connection', (ws) => {
   ws.on('error', () => { /* close event follows */ });
 });
 
+// ------------------------------------------------- auto-advance (250 ms) ----
+// The SERVER is the authority on track changes: relying on each client's local
+// `onended` would make every device advance on its own clock. When the current
+// track is inside its final (leadTime + 300 ms) window, we schedule the next
+// track to start EXACTLY when this one ends — clients get ≥1.2 s of notice, so
+// the sample-accurate scheduling machinery covers the gap and the transition
+// is seamless. If some client hasn't finished decoding the next track yet, we
+// hold (brief synchronized "buffering") and start 1.5 s after readiness — or
+// after ADVANCE_WAIT_MS with whoever is ready.
+setInterval(() => {
+  for (const session of S.sessions.values()) {
+    const p = session.playback;
+    if (p.status !== 'playing' || p.click) continue;
+    const track = S.currentTrack(session);
+    if (!track || !track.duration) continue;
+    const remainingMs = (track.duration - S.position(session)) * 1000;
+    if (remainingMs > S.PLAY_LEAD_TIME_MS + 300) continue;
+
+    const nextId = S.resolveNextId(session);
+    if (!nextId) {
+      // End of the queue: let it run out, then stop cleanly.
+      if (remainingMs <= -750) stopPlayback(session, true);
+      continue;
+    }
+    const everyoneReady = allConnectedReadyFor(session, nextId);
+    if (!everyoneReady) {
+      if (!session.advanceWaitSince) session.advanceWaitSince = Date.now();
+      if (Date.now() - session.advanceWaitSince < S.ADVANCE_WAIT_MS) continue; // hold
+    }
+    // Gapless when possible: start the next track at the outgoing track's end.
+    const leadMs = Math.max(remainingMs, everyoneReady ? 250 : S.PLAY_LEAD_TIME_MS);
+    startTrack(session, nextId, 0, leadMs);
+  }
+}, 250);
+
 // ------------------------------------------------------------ heartbeats ----
 // Every 5 s: authoritative position broadcast → clients measure their drift.
 setInterval(() => {
   for (const session of S.sessions.values()) {
     if (session.playback.status !== 'playing') continue;
-    const pos = S.position(session);
-    // Auto-stop when a (non-click) track runs past its end.
-    if (!session.playback.click && session.track && session.track.duration && pos > session.track.duration + 0.75) {
-      session.playback = { status: 'idle', trackOffset: 0, startAtServerTime: 0, pausedPosition: 0, click: false };
-      S.broadcast(session, { type: 'stop', ended: true });
-      continue;
-    }
     S.broadcast(session, {
       type: 'position-heartbeat',
       serverTime: now(),
-      trackPosition: pos,
+      trackPosition: S.position(session),
       status: 'playing',
     });
   }

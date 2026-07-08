@@ -111,24 +111,26 @@ export class SyncPlayer {
     return out + (this.ctx.baseLatency || 0);
   }
 
-  async load(url, onProgress) {
+  get duration() {
+    return this.buffer ? this.buffer.duration : 0;
+  }
+
+  // The queue prefetch (main.js) owns the decoded buffers; the player only
+  // holds the one being scheduled.
+  setBuffer(buffer) {
+    this.buffer = buffer;
+  }
+
+  // Decode without touching current playback (prefetch of the next track).
+  async decode(url) {
     this.init();
-    this.stopLocal();
-    this.buffer = null;
     const res = await fetch(url);
     if (!res.ok) throw new Error('download failed');
     const data = await res.arrayBuffer();
-    if (onProgress) onProgress('decoding');
-    // decodeAudioData with promise + callback fallback (older Safari)
-    this.buffer = await new Promise((resolve, reject) => {
+    return new Promise((resolve, reject) => {
       const p = this.ctx.decodeAudioData(data, resolve, reject);
       if (p && p.then) p.then(resolve, reject);
     });
-    return this.buffer.duration;
-  }
-
-  get duration() {
-    return this.buffer ? this.buffer.duration : 0;
   }
 
   // 1 s looped buffer with a short 1.5 kHz burst at t=0 — one beat per second.
@@ -155,7 +157,12 @@ export class SyncPlayer {
     if (!this.ctx || this.ctx.state !== 'running') return false;
     const buf = click ? this.clickBuffer() : this.buffer;
     if (!buf) return false;
-    this.stopLocal(fadeIn > 0 ? fadeIn : 0.02);
+    // Detach the old source but DON'T silence it yet: it keeps playing until
+    // the instant the new one starts (gapless queue advance, seamless seek).
+    const old = this.source;
+    const oldGain = this.srcGain;
+    this.source = null;
+    this.srcGain = null;
     this.clickMode = click;
     this.lastPlayMsg = { startAtServerTime, trackOffset, click };
     this._sampleMap();
@@ -169,9 +176,20 @@ export class SyncPlayer {
       offset += minStart - when;
       when = minStart;
     }
+    if (old && oldGain) {
+      // Cut the outgoing source exactly at the handover with a 20 ms fade.
+      try {
+        const cut = Math.max(this.ctx.currentTime, when - 0.02);
+        oldGain.gain.cancelScheduledValues(this.ctx.currentTime);
+        oldGain.gain.setValueAtTime(oldGain.gain.value, cut);
+        oldGain.gain.linearRampToValueAtTime(0.0001, when);
+        old.stop(when + 0.02);
+      } catch { /* already stopped */ }
+    }
     if (click) {
       offset = offset % buf.duration;
     } else if (offset >= buf.duration) {
+      this.playing = false;
       return false; // past the end
     }
     this._startSource(buf, when, offset, click, fadeIn);
@@ -277,9 +295,15 @@ export class SyncPlayer {
     this.lastHeartbeat = { serverTime, trackPosition };
     if (!this.playing || this.clickMode || !this.ctx) return 0;
     this._sampleMap();
-    const ctxAtHb = this.ctxTimeFor(this.clock.serverToLocal(serverTime));
+    // Track-transition window: the next source is scheduled but hasn't started
+    // yet (and the server's authoritative position describes the not-yet-
+    // started segment as 0). Comparing positions here is meaningless and the
+    // resulting "correction" would start the new track early — skip.
     const ctxNow = this.ctx.currentTime;
+    if (ctxNow < this.anchorCtx + 0.05) return 0;
+    const ctxAtHb = this.ctxTimeFor(this.clock.serverToLocal(serverTime));
     const expected = trackPosition + (ctxNow - ctxAtHb) - this.shiftSec;
+    if (expected < 0.1) return 0; // segment not really rolling server-side yet
     const drift = this.position() - expected;
     this.lastDrift = drift;
     const abs = Math.abs(drift);

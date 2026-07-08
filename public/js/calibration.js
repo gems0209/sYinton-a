@@ -15,11 +15,13 @@ export const CAL_MAX = 250;
 export const CAL_STEP = 5;
 
 export function loadCalibration() {
-  const v = parseInt(localStorage.getItem(KEY), 10);
+  let raw = null;
+  try { raw = localStorage.getItem(KEY); } catch { /* private mode */ }
+  const v = parseInt(raw, 10);
   if (Number.isNaN(v)) return 0;
   return Math.max(CAL_MIN, Math.min(CAL_MAX, v));
 }
 
 export function saveCalibration(ms) {
-  localStorage.setItem(KEY, String(ms));
+  try { localStorage.setItem(KEY, String(ms)); } catch { /* private mode */ }
 }

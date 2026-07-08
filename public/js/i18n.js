@@ -120,7 +120,11 @@ export const STRINGS = {
   },
 };
 
-let lang = localStorage.getItem('wavepool-lang') || 'it';
+function safeGet(key) {
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+
+let lang = safeGet('wavepool-lang') || 'it';
 const listeners = [];
 
 export function getLang() {
@@ -130,7 +134,7 @@ export function getLang() {
 export function setLang(l) {
   if (!STRINGS[l] || l === lang) return;
   lang = l;
-  localStorage.setItem('wavepool-lang', l);
+  try { localStorage.setItem('wavepool-lang', l); } catch { /* private mode */ }
   apply();
   for (const fn of listeners) fn(l);
 }

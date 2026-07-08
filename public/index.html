@@ -6,6 +6,19 @@
   <meta name="theme-color" content="#000000">
   <title>sYintonia</title>
   <link rel="stylesheet" href="/css/style.css">
+  <script>
+    // Failsafe error reporter: if any script dies, say it on screen instead of
+    // silently doing nothing. Runs before the module graph loads.
+    window.addEventListener('error', function (e) {
+      var b = document.getElementById('msgband');
+      if (b) { b.hidden = false; b.textContent = 'ERR: ' + (e.message || 'SCRIPT FAILED'); }
+    });
+    window.addEventListener('unhandledrejection', function (e) {
+      var b = document.getElementById('msgband');
+      var m = (e.reason && (e.reason.message || e.reason)) || 'PROMISE FAILED';
+      if (b) { b.hidden = false; b.textContent = 'ERR: ' + m; }
+    });
+  </script>
 </head>
 <body>
 
@@ -27,10 +40,11 @@
       <details class="help" id="help">
         <summary><span class="help-q">?</span> <span data-i18n="help_title">COME FUNZIONA</span></summary>
         <div class="help-body">
-          <p data-i18n="help_1"></p>
-          <p data-i18n="help_2"></p>
-          <p data-i18n="help_3"></p>
-          <p class="dim" data-i18n="help_4"></p>
+          <!-- static Italian defaults: readable even before (or without) JS -->
+          <p data-i18n="help_1">1 — UN TELEFONO CREA LA SESSIONE E CARICA UNA TRACCIA.</p>
+          <p data-i18n="help_2">2 — GLI ALTRI ENTRANO COL CODICE, SU QUESTO SITO.</p>
+          <p data-i18n="help_3">3 — PLAY: TUTTE LE CASSE SUONANO INSIEME, IN SYNC.</p>
+          <p class="dim" data-i18n="help_4">FUORI SYNC? USA LO SLIDER DI CALIBRAZIONE.</p>
         </div>
       </details>
 

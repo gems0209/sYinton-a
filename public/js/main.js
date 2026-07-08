@@ -9,11 +9,22 @@ import { t, apply as applyI18n, setLang, onLangChange } from './i18n.js';
 const $ = (id) => document.getElementById(id);
 
 // ------------------------------------------------------------------ state --
+// Storage can THROW (Safari private browsing) — never let it kill the app.
+export function safeGet(store, key) {
+  try { return store.getItem(key); } catch { return null; }
+}
+export function safeSet(store, key, value) {
+  try { store.setItem(key, value); } catch { /* private mode: no persistence */ }
+}
+function safeRemove(store, key) {
+  try { store.removeItem(key); } catch { /* ignore */ }
+}
+
 function getClientId() {
-  let id = sessionStorage.getItem('wavepool-client-id');
+  let id = safeGet(sessionStorage, 'wavepool-client-id');
   if (!id) {
     id = Math.random().toString(36).slice(2, 10);
-    sessionStorage.setItem('wavepool-client-id', id);
+    safeSet(sessionStorage, 'wavepool-client-id', id);
   }
   return id;
 }
@@ -61,7 +72,7 @@ function showView(name) {
   if (name === 'home') {
     S.role = null;
     S.code = null;
-    sessionStorage.removeItem('wavepool-session');
+    safeRemove(sessionStorage, 'wavepool-session');
   }
 }
 
@@ -91,7 +102,10 @@ function fmtMs(ms) {
 // (auto-rejoin after reload) and iOS edge cases.
 function armThen(fn) {
   player.init();
-  player.arm().then((ok) => {
+  // Some browsers leave resume() pending until a "better" gesture: don't hang
+  // silently, fall through to the overlay after 1.5 s.
+  const timeout = new Promise((resolve) => setTimeout(() => resolve(false), 1500));
+  Promise.race([player.arm(), timeout]).then((ok) => {
     if (ok) { fn(); return; }
     const ov = $('arm-overlay');
     ov.hidden = false;
@@ -131,7 +145,14 @@ onLangChange(() => {
 });
 
 // ------------------------------------------------------------------ home ---
+// First ever visit: the explainer starts open, then stays collapsed.
+if (!safeGet(localStorage, 'wavepool-seen')) {
+  $('help').open = true;
+  safeSet(localStorage, 'wavepool-seen', '1');
+}
+
 $('btn-create').addEventListener('click', () => {
+  if (!ws.open) flash(t('reconnecting')); // visible feedback; the message is queued
   armThen(() => ws.send({ type: 'create', clientId: S.clientId }));
 });
 
@@ -161,6 +182,7 @@ codeInputs.forEach((input, idx) => {
 function joinWithCode() {
   const code = readCode();
   if (code.length !== 4) return;
+  if (!ws.open) flash(t('reconnecting'));
   armThen(() => ws.send({ type: 'join', sessionCode: code, clientId: S.clientId }));
 }
 $('btn-join').addEventListener('click', joinWithCode);
@@ -180,7 +202,7 @@ ws.on('_open', async () => {
   await clock.burst(ws._everSynced ? 10 : 20);
   ws._everSynced = true;
   clock.startPeriodic();
-  const saved = sessionStorage.getItem('wavepool-session');
+  const saved = safeGet(sessionStorage, 'wavepool-session');
   if (saved && !S.code) {
     // Auto-rejoin after reload — needs the arm overlay (no gesture available).
     armThen(() => ws.send({ type: 'join', sessionCode: saved, clientId: S.clientId }));
@@ -200,7 +222,7 @@ ws.on('joined', (msg) => {
 ws.on('error', (msg) => {
   if (msg.code === 'SESSION_NOT_FOUND') {
     flash(t('err_not_found'));
-    sessionStorage.removeItem('wavepool-session');
+    safeRemove(sessionStorage, 'wavepool-session');
     codeInputs.forEach((i) => { i.value = ''; });
     codeInputs[0].focus();
   } else if (msg.code === 'NOT_READY') {
@@ -274,7 +296,7 @@ function enterSession(code, role, track, playback, peers) {
   S.peers = peers || [];
   S.track = track ? { name: track.name, duration: track.duration } : null;
   S.playback = playback || { status: 'idle' };
-  sessionStorage.setItem('wavepool-session', code);
+  safeSet(sessionStorage, 'wavepool-session', code);
 
   if (role === 'lead') {
     $('lead-code').textContent = code;

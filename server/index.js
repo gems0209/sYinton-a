@@ -27,6 +27,8 @@ const app = express();
 app.use(express.static(path.join(ROOT, 'public')));
 // /debug is a client-side view of the same SPA.
 app.get('/debug', (_req, res) => res.sendFile(path.join(ROOT, 'public', 'index.html')));
+// Shareable session URLs (/5CEG): same SPA, the client auto-joins as satellite.
+app.get('/:code([A-Za-z0-9]{4})', (_req, res) => res.sendFile(path.join(ROOT, 'public', 'index.html')));
 
 // ---------------------------------------------------------------- upload ----
 const ALLOWED_EXT = new Set(['.mp3', '.wav', '.ogg', '.m4a', '.flac']);

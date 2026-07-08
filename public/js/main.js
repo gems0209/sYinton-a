@@ -41,6 +41,12 @@ const S = {
   forceTimer: null,
 };
 
+// Shareable session URL: /5CEG → prefill the code and auto-join as satellite.
+function urlSessionCode() {
+  const m = location.pathname.match(/^\/([A-Za-z0-9]{4})$/);
+  return m ? m[1].toUpperCase() : null;
+}
+
 const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
 const ws = new WPSocket(`${wsProto}//${location.host}`);
 const clock = new ClockSync(ws);
@@ -73,6 +79,7 @@ function showView(name) {
     S.role = null;
     S.code = null;
     safeRemove(sessionStorage, 'wavepool-session');
+    if (location.pathname !== '/debug') history.replaceState(null, '', '/');
   }
 }
 
@@ -218,10 +225,11 @@ ws.on('_open', async () => {
   await clock.burst(ws._everSynced ? 10 : 20);
   ws._everSynced = true;
   clock.startPeriodic();
-  const saved = safeGet(sessionStorage, 'wavepool-session');
-  if (saved && !S.code) {
-    // Auto-rejoin after reload — needs the arm overlay (no gesture available).
-    armThen(() => ws.send({ type: 'join', sessionCode: saved, clientId: S.clientId }));
+  // Join priority: shared URL (/5CEG) wins over a previously saved session.
+  const target = urlSessionCode() || safeGet(sessionStorage, 'wavepool-session');
+  if (target && !S.code) {
+    // Auto-join — needs the arm overlay (no usable gesture on page load).
+    armThen(() => ws.send({ type: 'join', sessionCode: target, clientId: S.clientId }));
   } else if (S.code) {
     ws.send({ type: 'join', sessionCode: S.code, clientId: S.clientId });
   }
@@ -239,6 +247,7 @@ ws.on('error', (msg) => {
   if (msg.code === 'SESSION_NOT_FOUND') {
     flash(t('err_not_found'));
     safeRemove(sessionStorage, 'wavepool-session');
+    history.replaceState(null, '', '/'); // drop a dead shared URL
     codeInputs.forEach((i) => { i.value = ''; });
     codeInputs[0].focus();
   } else if (msg.code === 'NOT_READY') {
@@ -314,6 +323,9 @@ function enterSession(code, role, track, playback, peers) {
   S.track = track ? { name: track.name, duration: track.duration } : null;
   S.playback = playback || { status: 'idle' };
   safeSet(sessionStorage, 'wavepool-session', code);
+  // The address bar becomes the invite: copy/share the URL and whoever opens
+  // it joins this session as a satellite.
+  history.replaceState(null, '', `/${code}`);
 
   if (role === 'lead') {
     $('lead-code').textContent = code;
@@ -499,7 +511,25 @@ function updateTransport() {
 }
 
 // Progress bar + technical readout, 4×/s (cheap; the audio clock is the truth).
+// Also a stall watchdog: iOS can freeze audioContext.currentTime (silent
+// switch / route changes) while state still reads 'running' — the UI says
+// PLAYING but nothing moves. Detect the frozen clock and self-heal.
+let stallClock = -1;
+let stallTicks = 0;
 setInterval(() => {
+  if (player.playing && player.ctx) {
+    if (player.ctx.currentTime === stallClock) {
+      stallTicks++;
+      if (stallTicks >= 10) { // frozen for ~2.5 s
+        stallTicks = 0;
+        player.playing = false; // drop the dead source; ensurePlaying re-arms
+        ensurePlaying();
+      }
+    } else {
+      stallClock = player.ctx.currentTime;
+      stallTicks = 0;
+    }
+  }
   if (S.role === 'lead' && S.track?.duration) {
     const pos = S.playback.status === 'playing' ? player.idealPosition()
       : (S.playback.status === 'paused' ? (S.playback.position || 0) : player.lastPos);
@@ -556,6 +586,12 @@ document.addEventListener('visibilitychange', async () => {
   }
   ensurePlaying();
 });
+
+// Shared URL: show the code in the boxes while the auto-join runs.
+{
+  const uc = urlSessionCode();
+  if (uc) uc.split('').forEach((ch, i) => { codeInputs[i].value = ch; });
+}
 
 // ------------------------------------------------------------------ debug --
 if (location.pathname === '/debug') {

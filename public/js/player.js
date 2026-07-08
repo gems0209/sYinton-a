@@ -17,6 +17,10 @@
 // ideal server position by -shiftSec. Drift checks must compare like with
 // like: drift = measuredPos - (idealServerPos - shiftSec).
 
+// iPadOS 13+ pretends to be MacIntel; the touch check catches it.
+const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
+  || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
 export class SyncPlayer {
   constructor(clock) {
     this.clock = clock;
@@ -49,7 +53,20 @@ export class SyncPlayer {
     this.analyser.fftSize = 1024;
     this.analyser.smoothingTimeConstant = 0.85;
     this.master.connect(this.analyser);
-    this.analyser.connect(this.ctx.destination);
+    if (IS_IOS) {
+      // iOS mutes raw Web Audio output with the hardware silent switch, but
+      // treats <audio>-element playback as "media" (like YouTube) and lets it
+      // through. Route the mix into an element via MediaStream. This path has
+      // a device-fixed extra latency — that's what the calibration slider and
+      // the click track are for.
+      this.mediaDest = this.ctx.createMediaStreamDestination();
+      this.analyser.connect(this.mediaDest);
+      this.audioEl = document.createElement('audio');
+      this.audioEl.setAttribute('playsinline', '');
+      this.audioEl.srcObject = this.mediaDest.stream;
+    } else {
+      this.analyser.connect(this.ctx.destination);
+    }
     this._sampleMap();
     // Re-sample often: the two clocks tick at (slightly) different rates and
     // ctx.currentTime freezes while suspended.
@@ -68,6 +85,11 @@ export class SyncPlayer {
       s.connect(this.ctx.destination);
       s.start(0);
     } catch { /* ignore */ }
+    if (this.audioEl) {
+      // Must start inside a user gesture at least once (iOS media policy).
+      try { await this.audioEl.play(); } catch { /* overlay will retry */ }
+    }
+    // Safari exposes a non-standard 'interrupted' state — treat it as not armed.
     return this.ctx.state === 'running';
   }
 

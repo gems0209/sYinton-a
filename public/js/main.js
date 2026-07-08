@@ -100,6 +100,17 @@ function fmtMs(ms) {
 // AudioContext starts suspended (autoplay policy). We arm inside the CREATE /
 // JOIN tap when possible; the overlay covers flows with no usable gesture
 // (auto-rejoin after reload) and iOS edge cases.
+let armPending = null;
+$('arm-overlay').addEventListener('click', async () => {
+  const armed = await player.arm();
+  if (!armed) return; // keep overlay until the context is really running
+  $('arm-overlay').hidden = true;
+  waves.arm.stop();
+  const fn = armPending;
+  armPending = null;
+  if (fn) fn();
+});
+
 function armThen(fn) {
   player.init();
   // Some browsers leave resume() pending until a "better" gesture: don't hang
@@ -107,18 +118,23 @@ function armThen(fn) {
   const timeout = new Promise((resolve) => setTimeout(() => resolve(false), 1500));
   Promise.race([player.arm(), timeout]).then((ok) => {
     if (ok) { fn(); return; }
-    const ov = $('arm-overlay');
-    ov.hidden = false;
+    armPending = fn; // replaces any stale pending action
+    $('arm-overlay').hidden = false;
     waves.arm.start();
-    const onTap = async () => {
-      const armed = await player.arm();
-      if (!armed) return; // keep overlay until the context is really running
-      ov.hidden = true;
-      waves.arm.stop();
-      ov.removeEventListener('click', onTap);
-      fn();
-    };
-    ov.addEventListener('click', onTap);
+  });
+}
+
+// Self-heal: the session says "playing" but this device is silent (context was
+// suspended when the play broadcast arrived, tab was backgrounded, schedule
+// failed…). Called on every heartbeat and on foregrounding — re-arms (overlay
+// if a gesture is needed) and re-schedules from the authoritative timeline.
+function ensurePlaying() {
+  if (!S.code || S.playback.status !== 'playing' || S.playback.click) return;
+  if (S.loading || player.playing || !player.buffer) return;
+  armThen(() => {
+    if (S.playback.status === 'playing' && !player.playing) {
+      schedulePlayback(S.playback.startAtServerTime, S.playback.trackOffset, false);
+    }
   });
 }
 
@@ -280,6 +296,7 @@ ws.on('stop', () => {
 ws.on('position-heartbeat', (msg) => {
   if (msg.status && msg.status !== 'playing') return;
   player.checkDrift(msg.serverTime, msg.trackPosition);
+  ensurePlaying();
   renderTech();
 });
 
@@ -537,6 +554,7 @@ document.addEventListener('visibilitychange', async () => {
     await clock.burst(5);
     if (S.code) ws.send({ type: 'position-request', sessionCode: S.code });
   }
+  ensurePlaying();
 });
 
 // ------------------------------------------------------------------ debug --

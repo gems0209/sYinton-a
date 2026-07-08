@@ -1,7 +1,7 @@
 {
-  "name": "syintonia",
+  "name": "syntonia",
   "version": "1.0.0",
-  "description": "sYintonia — distributed smartphone sound system, synchronized audio playback",
+  "description": "sYntonia — distributed smartphone sound system, synchronized audio playback",
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js"

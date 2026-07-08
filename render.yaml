@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: syintonia
+    name: syntonia
     runtime: node
     plan: free
     buildCommand: npm install

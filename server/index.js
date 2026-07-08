@@ -1,5 +1,5 @@
 'use strict';
-// sYintonia server — Express (static + upload) + ws (session protocol + clock sync).
+// sYntonia server — Express (static + upload) + ws (session protocol + clock sync).
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -400,7 +400,7 @@ function lanAddresses() {
 }
 
 server.listen(PORT, () => {
-  console.log('sYintonia up.');
+  console.log('sYntonia up.');
   console.log(`  local:   http://localhost:${PORT}`);
   for (const ip of lanAddresses()) {
     console.log(`  LAN:     http://${ip}:${PORT}   <- share this with the other phones`);

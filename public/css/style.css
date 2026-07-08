@@ -1,4 +1,4 @@
-/* sYintonia — industrial minimal brutalism.
+/* sYntonia — industrial minimal brutalism.
    Strictly monochrome. Zero border-radius, zero shadows, zero gradients.
    States are communicated by weight, inversion and blink — never by color. */
 
@@ -156,7 +156,7 @@ main {
   color: var(--text);
   line-height: 1.9;
 }
-.help-body p.dim { margin-top: 0.4rem; }
+.help-body p.dim { margin-top: 0.4rem; text-transform: none; font-size: 0.72rem; color: var(--disabled); }
 
 /* ------------------------------------------------------------------ home */
 .home-blocks { display: flex; flex-direction: column; }

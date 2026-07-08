@@ -1,4 +1,4 @@
-# sYintonia
+# sYntonia
 
 Turn a group of smartphones into one distributed sound system: a **lead** device uploads a track, the others join with a 4-char code and every speaker plays it in tight sync.
 

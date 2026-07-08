@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#000000">
+  <title>sYintonia</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+  <header class="bar">
+    <a class="logo" href="/" id="logo-home">sYintonia</a>
+    <div class="lang" role="group" aria-label="Language">
+      <button type="button" data-lang="it">IT</button><span class="lang-sep">/</span><button type="button" data-lang="en">EN</button>
+    </div>
+  </header>
+
+  <canvas class="wave wave-top" id="wave-top" aria-hidden="true"></canvas>
+
+  <div class="msgband" id="msgband" role="status" hidden></div>
+
+  <main id="app">
+
+    <!-- ============================================================ HOME -->
+    <section id="view-home" class="view">
+      <details class="help" id="help">
+        <summary><span class="help-q">?</span> <span data-i18n="help_title">COME FUNZIONA</span></summary>
+        <div class="help-body">
+          <p data-i18n="help_1"></p>
+          <p data-i18n="help_2"></p>
+          <p data-i18n="help_3"></p>
+          <p class="dim" data-i18n="help_4"></p>
+        </div>
+      </details>
+
+      <div class="home-blocks">
+        <button type="button" class="block-action" id="btn-create" data-i18n="create">CREA SESSIONE</button>
+
+        <canvas class="wave wave-mid" id="wave-home" aria-hidden="true"></canvas>
+
+        <div class="block-join">
+          <label class="label" for="code-0" data-i18n="join_label">CODICE SESSIONE</label>
+          <div class="code-inputs" id="code-inputs">
+            <input id="code-0" class="code-char" type="text" inputmode="latin" autocomplete="off" autocapitalize="characters" maxlength="4" aria-label="1">
+            <input id="code-1" class="code-char" type="text" inputmode="latin" autocomplete="off" autocapitalize="characters" maxlength="4" aria-label="2">
+            <input id="code-2" class="code-char" type="text" inputmode="latin" autocomplete="off" autocapitalize="characters" maxlength="4" aria-label="3">
+            <input id="code-3" class="code-char" type="text" inputmode="latin" autocomplete="off" autocapitalize="characters" maxlength="4" aria-label="4">
+          </div>
+          <button type="button" class="block-action" id="btn-join" data-i18n="join">UNISCITI</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ LEAD -->
+    <section id="view-lead" class="view" hidden>
+      <div class="spec-row">
+        <span class="label" data-i18n="session">SESSIONE</span>
+        <span class="hint" data-i18n="lead_hint"></span>
+      </div>
+      <div class="session-code" id="lead-code" aria-live="polite">····</div>
+
+      <div class="spec-grid">
+        <div class="spec-cell">
+          <span class="label"><span data-i18n="devices">DISPOSITIVI</span>: <span id="lead-count" class="num">00</span></span>
+          <ul class="device-list" id="device-list"></ul>
+        </div>
+        <div class="spec-cell">
+          <span class="label"><span data-i18n="status">STATO</span>: <span id="lead-status">IDLE</span></span>
+          <div class="track-line"><span class="label" data-i18n="track">TRACCIA</span>: <span id="lead-track" data-i18n="no_track">NESSUNA TRACCIA</span></div>
+        </div>
+      </div>
+
+      <div class="dropzone" id="dropzone" role="button" tabindex="0">
+        <span id="drop-label" data-i18n="drop">TRASCINA IL FILE QUI — O TOCCA</span>
+        <span class="dim" data-i18n="drop_hint"></span>
+        <input type="file" id="file-input" accept=".mp3,.wav,.ogg,.m4a,.flac,audio/*" hidden>
+      </div>
+
+      <div class="transport">
+        <button type="button" id="btn-play" data-i18n="play" disabled>PLAY</button>
+        <button type="button" id="btn-pause" data-i18n="pause" disabled>PAUSE</button>
+        <button type="button" id="btn-stop" data-i18n="stop" disabled>STOP</button>
+        <button type="button" id="btn-force" class="ghost" data-i18n="play_anyway" hidden>AVVIA COMUNQUE</button>
+      </div>
+
+      <div class="progress" id="progress" role="slider" aria-label="seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" tabindex="0">
+        <div class="progress-fill" id="progress-fill"></div>
+      </div>
+      <div class="time-line num"><span id="time-cur">00:00</span> / <span id="time-dur">00:00</span></div>
+
+      <div class="spec-row">
+        <button type="button" id="btn-click" class="ghost" data-i18n="click_start">CLICK TRACK</button>
+        <span class="dim" id="click-hint" data-i18n="click_hint" hidden></span>
+      </div>
+
+      <div class="techline num" id="lead-tech" aria-hidden="true"></div>
+      <div class="spec-row">
+        <button type="button" id="btn-leave-lead" class="ghost" data-i18n="leave">ESCI</button>
+      </div>
+    </section>
+
+    <!-- ======================================================= SATELLITE -->
+    <section id="view-sat" class="view" hidden>
+      <div class="spec-grid">
+        <div class="spec-cell">
+          <span class="label"><span data-i18n="session">SESSIONE</span>: <span id="sat-code" class="num"></span></span>
+        </div>
+        <div class="spec-cell">
+          <span class="label"><span data-i18n="status">STATO</span>: <span id="sat-status">—</span></span>
+        </div>
+      </div>
+      <div class="track-line center"><span id="sat-track" class="track-name"></span></div>
+
+      <canvas class="wave wave-sat" id="wave-sat" aria-hidden="true"></canvas>
+      <div class="sat-waiting label" id="sat-waiting" data-i18n="st_waiting">IN ATTESA DEL LEAD</div>
+
+      <div class="sliders">
+        <div class="slider-row">
+          <label class="label" for="vol"><span data-i18n="volume">VOLUME</span> <span class="num" id="vol-val">100</span></label>
+          <input type="range" id="vol" min="0" max="100" value="100" step="1">
+        </div>
+        <div class="slider-row">
+          <label class="label" for="cal"><span data-i18n="calibration">CALIBRAZIONE</span> <span class="num" id="cal-val">+000MS</span></label>
+          <input type="range" id="cal" min="-250" max="250" value="0" step="5">
+          <span class="dim" data-i18n="cal_hint"></span>
+        </div>
+      </div>
+
+      <div class="techline num" id="sat-tech" aria-hidden="true"></div>
+      <div class="spec-row">
+        <span class="dim" id="keep-screen" data-i18n="keep_screen" hidden></span>
+        <span class="dim" data-i18n="sat_hint"></span>
+      </div>
+      <div class="spec-row">
+        <button type="button" id="btn-leave-sat" class="ghost" data-i18n="leave">ESCI</button>
+      </div>
+    </section>
+
+    <!-- =========================================================== DEBUG -->
+    <section id="view-debug" class="view" hidden>
+      <div class="spec-row"><span class="label" data-i18n="debug_title">DEBUG</span></div>
+      <table class="debug-table num">
+        <tr><td class="label" data-i18n="dbg_offset"></td><td id="dbg-offset">—</td></tr>
+        <tr><td class="label" data-i18n="dbg_rtt"></td><td id="dbg-rtt">—</td></tr>
+        <tr><td class="label" data-i18n="dbg_unc"></td><td id="dbg-unc">—</td></tr>
+        <tr><td class="label" data-i18n="dbg_drift"></td><td id="dbg-drift">—</td></tr>
+        <tr><td class="label" data-i18n="dbg_outlat"></td><td id="dbg-outlat">—</td></tr>
+      </table>
+      <div class="spec-row">
+        <button type="button" id="btn-resync" data-i18n="dbg_resync">RESYNC</button>
+        <a href="/" class="ghost btn-link" data-i18n="dbg_back">TORNA ALL’APP</a>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ARM OVERLAY -->
+  <div class="arm-overlay" id="arm-overlay" hidden>
+    <canvas class="wave wave-arm" id="wave-arm" aria-hidden="true"></canvas>
+    <button type="button" id="btn-arm" class="arm-text" data-i18n="arm">TOCCA PER ATTIVARE L’AUDIO</button>
+  </div>
+
+  <canvas class="wave wave-bottom" id="wave-bottom" aria-hidden="true"></canvas>
+
+  <footer class="bar foot">
+    <span class="num" id="net-status">—</span>
+    <a href="/debug" class="dim">DEBUG</a>
+  </footer>
+
+  <script type="module" src="/js/main.js"></script>
+</body>
+</html>

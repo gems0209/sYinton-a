@@ -1,0 +1,17 @@
+{
+  "name": "syintonia",
+  "version": "1.0.0",
+  "description": "sYintonia — distributed smartphone sound system, synchronized audio playback",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "multer": "^2.0.1",
+    "ws": "^8.18.0"
+  }
+}

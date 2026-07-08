@@ -1,0 +1,28 @@
+# dependencies
+node_modules/
+
+# runtime uploads (folder kept via .gitkeep)
+uploads/*
+!uploads/.gitkeep
+
+# env & secrets
+.env
+.env.*
+
+# logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# editors / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# build / test artifacts
+dist/
+coverage/

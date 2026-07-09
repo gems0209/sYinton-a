@@ -175,6 +175,7 @@ onLangChange(() => {
   renderStatus();
   renderTrack();
   renderQueue();
+  $('btn-cal-lock').textContent = t($('cal').disabled ? 'cal_unlock' : 'cal_lock');
   $('net-status').textContent = ws.open ? t('connected') : t('reconnecting');
 });
 
@@ -684,8 +685,26 @@ const cal = $('cal');
 cal.value = loadCalibration();
 $('cal-val').textContent = fmtMs(cal.value);
 player.calibrationMs = Number(cal.value);
+
+// The calibration slider is LOCKED by default — people nudge it by accident.
+// Tap SBLOCCA to edit; it re-locks itself after 15 s without input.
+const calLockBtn = $('btn-cal-lock');
+let calRelockTimer = null;
+function setCalLocked(locked) {
+  cal.disabled = locked;
+  calLockBtn.textContent = t(locked ? 'cal_unlock' : 'cal_lock');
+  calLockBtn.classList.toggle('on', !locked);
+  clearTimeout(calRelockTimer);
+  if (!locked) calRelockTimer = setTimeout(() => setCalLocked(true), 15000);
+}
+calLockBtn.addEventListener('click', () => setCalLocked(!cal.disabled));
+setCalLocked(true); // locked at boot, label in the active language
+
 cal.addEventListener('input', () => {
   $('cal-val').textContent = fmtMs(cal.value);
+  // still editing: push the auto-relock forward
+  clearTimeout(calRelockTimer);
+  calRelockTimer = setTimeout(() => setCalLocked(true), 15000);
 });
 cal.addEventListener('change', () => {
   const ms = Number(cal.value);

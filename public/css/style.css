@@ -386,6 +386,28 @@ main {
 .slider-row label { display: flex; justify-content: space-between; }
 .slider-row .num { color: var(--white); }
 
+/* Calibration lock: the slider is disabled until unlocked. */
+.cal-row { display: flex; align-items: center; gap: 0.8rem; }
+.cal-row input[type="range"] { flex: 1; min-width: 0; }
+.cal-lock {
+  flex: none;
+  min-height: 44px;
+  padding: 0 0.9rem;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  font-size: 0.68rem;
+  cursor: pointer;
+  transition: background 80ms linear, color 80ms linear;
+}
+.cal-lock:hover { background: var(--white); color: #000; }
+.cal-lock.on { background: var(--white); color: #000; border-color: var(--white); }
+input[type="range"]:disabled { cursor: default; opacity: 1; }
+input[type="range"]:disabled::-webkit-slider-thumb { background: var(--disabled); }
+input[type="range"]:disabled::-moz-range-thumb { background: var(--disabled); }
+
 /* Custom sliders: 2px track, rectangular white thumb. No native styling. */
 input[type="range"] {
   -webkit-appearance: none;

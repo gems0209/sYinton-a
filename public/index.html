@@ -156,7 +156,10 @@
         </div>
         <div class="slider-row">
           <label class="label" for="cal"><span data-i18n="calibration">CALIBRAZIONE</span> <span class="num" id="cal-val">+000MS</span></label>
-          <input type="range" id="cal" min="-250" max="250" value="0" step="5">
+          <div class="cal-row">
+            <button type="button" id="btn-cal-lock" class="cal-lock">SBLOCCA</button>
+            <input type="range" id="cal" min="-250" max="250" value="0" step="5" disabled>
+          </div>
           <span class="dim" data-i18n="cal_hint"></span>
         </div>
       </div>

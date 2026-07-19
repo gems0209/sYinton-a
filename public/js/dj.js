@@ -169,7 +169,11 @@ async function analyzeBuffer(buf) {
 function needsAnalysis(tr) {
   if (analyzed.has(tr.id)) return false;
   if (!tr.meta) return true;
-  return tr.id === E.S.currentTrackId && !peaksCache.has(tr.id);
+  // Peaks are local-only: re-run (without re-sending meta) for whatever the
+  // deck views currently draw — the queue's current track and loaded decks.
+  const d = E.S.decks;
+  const onDeck = d && d.on && (d.A.trackId === tr.id || d.B.trackId === tr.id);
+  return (tr.id === E.S.currentTrackId || onDeck) && !peaksCache.has(tr.id);
 }
 
 async function pump() {
@@ -280,7 +284,12 @@ function drawDeck() {
 }
 
 function deckLoop() {
-  drawDeck();
+  if (E && E.S.decks && E.S.decks.on) {
+    drawStrip('A');
+    drawStrip('B');
+  } else {
+    drawDeck();
+  }
   deckRaf = requestAnimationFrame(deckLoop);
 }
 function setDeckRunning(on) {
@@ -377,7 +386,211 @@ function renderAll() {
   renderTempo();
   renderFxControls();
   renderCues();
+  renderDecks();
   deckDirty = true;
+}
+
+// ------------------------------------------------------------- dual deck --
+let xfPending = false;
+let xfTimer = null;
+
+function deckState(id) {
+  return (E.S.decks && E.S.decks[id]) || null;
+}
+function deckTrackObj(id) {
+  const d = deckState(id);
+  return d && d.trackId ? E.S.queue.find((q) => q.id === d.trackId) : null;
+}
+function deckUiPosition(id) {
+  const d = deckState(id);
+  if (!d) return 0;
+  if (d.status === 'playing' && E.player.deckPlaying(id)) return E.player.deckIdealPosition(id);
+  if (d.status === 'playing') {
+    // not (yet) rendering locally: extrapolate from the last snapshot
+    return d.position || 0;
+  }
+  return d.pausedPosition || 0;
+}
+
+function renderStrip(id) {
+  const d = deckState(id);
+  const track = deckTrackObj(id);
+  const name = $(`deck${id}-name`);
+  const bpmEl = $(`deck${id}-bpm`);
+  const play = $(`deck${id}-play`);
+  const sync = $(`deck${id}-sync`);
+  const pitch = $(`deck${id}-pitch`);
+  const pitchVal = $(`deck${id}-pitch-val`);
+  if (!d || !name) return;
+  name.textContent = track ? track.name.toUpperCase() : '—';
+  if (track && track.meta && track.meta.bpm) {
+    bpmEl.textContent = `${(track.meta.bpm * d.rate).toFixed(1)} BPM`;
+  } else {
+    bpmEl.textContent = track ? 'BPM —' : '';
+  }
+  play.disabled = !track;
+  play.textContent = d.status === 'playing' ? t('pause') : t('play');
+  play.classList.toggle('on', d.status === 'playing');
+  const other = deckTrackObj(id === 'A' ? 'B' : 'A');
+  sync.disabled = !(track && track.meta && track.meta.bpm && other && other.meta && other.meta.bpm);
+  if (document.activeElement !== pitch) pitch.value = String(Math.round(d.rate * 1000) / 10);
+  const pct = (d.rate - 1) * 100;
+  pitchVal.textContent = `${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%`;
+  // per-strip hot cues (the cues live on the TRACK, like in queue mode)
+  for (let i = 0; i < 4; i++) {
+    const b = $(`deck${id}-cue-${i}`);
+    if (!b) continue;
+    const cueVal = track && track.cues ? track.cues[i] : null;
+    b.disabled = !track;
+    b.classList.toggle('set', cueVal != null);
+    b.textContent = cueVal != null ? `${i + 1}·${fmtShort(cueVal)}` : String(i + 1);
+  }
+}
+
+function renderDecks() {
+  const on = !!(E.S.decks && E.S.decks.on);
+  const toggle = $('btn-decks');
+  if (!toggle) return;
+  toggle.textContent = `${t('decks')}: ${on ? t('on') : t('off')}`;
+  toggle.classList.toggle('on', on);
+  $('decks-panel').hidden = !on;
+  $('mix-queue-tools').hidden = on; // deck/cue/transition/tempo are queue tools
+  if (on) {
+    renderStrip('A');
+    renderStrip('B');
+    const xf = $('xfader');
+    if (document.activeElement !== xf && !xfPending) {
+      xf.value = String(Math.round((E.S.decks.xfader || 0) * 100));
+    }
+    drawStrip('A');
+    drawStrip('B');
+  }
+}
+
+function drawStrip(id) {
+  const cv = $(`deck${id}-wave`);
+  const d = deckState(id);
+  if (!cv || !d || cv.clientWidth === 0) return;
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const w = Math.round(cv.clientWidth * dpr);
+  const h = Math.round(cv.clientHeight * dpr);
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  const c = cv.getContext('2d');
+  c.clearRect(0, 0, w, h);
+  const track = deckTrackObj(id);
+  if (!track) return;
+  const peaks = peaksCache.get(track.id);
+  const mid = h / 2;
+  c.fillStyle = 'rgba(245,245,245,0.30)';
+  if (peaks) {
+    for (let x = 0; x < w; x++) {
+      const i = Math.min(peaks.length - 1, Math.floor(x / w * peaks.length));
+      const bh = Math.max(1, peaks[i] * (h - 4));
+      c.fillRect(x, mid - bh / 2, 1, bh);
+    }
+  } else {
+    c.fillRect(0, mid, w, 1);
+  }
+  if (track.duration) {
+    const frac = Math.min(1, Math.max(0, deckUiPosition(id) / track.duration));
+    c.globalCompositeOperation = 'source-atop';
+    c.fillStyle = 'rgba(245,245,245,0.45)';
+    c.fillRect(0, 0, Math.round(frac * w), h);
+    c.globalCompositeOperation = 'source-over';
+    c.fillStyle = '#FFFFFF';
+    c.fillRect(Math.round(frac * w), 0, Math.max(1, dpr), h);
+    const cues = track.cues || [];
+    for (let i = 0; i < 4; i++) {
+      if (cues[i] == null) continue;
+      const x = Math.round((cues[i] / track.duration) * w);
+      c.fillRect(x, 0, Math.max(1, dpr), 6 * dpr);
+    }
+  }
+}
+
+function sendXfader(x, immediate = false) {
+  clearTimeout(xfTimer);
+  xfPending = true;
+  const fire = () => { xfPending = false; send({ type: 'xfader', x }); };
+  if (immediate) fire();
+  else xfTimer = setTimeout(fire, 90);
+}
+
+function wireStrip(id) {
+  $(`deck${id}-play`).addEventListener('click', () => {
+    const d = deckState(id);
+    if (!d) return;
+    if (d.status === 'playing') send({ type: 'deck-pause', deck: id });
+    else send({ type: 'deck-play', deck: id });
+  });
+  $(`deck${id}-sync`).addEventListener('click', () => send({ type: 'deck-sync', deck: id }));
+  $(`deck${id}-reset`).addEventListener('click', () => {
+    send({ type: 'deck-rate', deck: id, rate: 1 });
+    $(`deck${id}-pitch`).value = '100';
+    $(`deck${id}-pitch-val`).textContent = '+0.0%';
+  });
+  const pitch = $(`deck${id}-pitch`);
+  let pitchTimer = null;
+  pitch.addEventListener('input', () => {
+    const pct = Number(pitch.value) - 100;
+    $(`deck${id}-pitch-val`).textContent = `${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%`;
+    clearTimeout(pitchTimer);
+    pitchTimer = setTimeout(() => send({ type: 'deck-rate', deck: id, rate: Number(pitch.value) / 100 }), 150);
+  });
+  pitch.addEventListener('change', () => {
+    clearTimeout(pitchTimer);
+    send({ type: 'deck-rate', deck: id, rate: Number(pitch.value) / 100 });
+  });
+  $(`deck${id}-wave`).addEventListener('click', (e) => {
+    const track = deckTrackObj(id);
+    if (!track || !track.duration) return;
+    const r = e.currentTarget.getBoundingClientRect();
+    const frac = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+    send({ type: 'deck-seek', deck: id, position: frac * track.duration });
+  });
+  for (let i = 0; i < 4; i++) {
+    const b = $(`deck${id}-cue-${i}`);
+    let holdTimer = null;
+    let held = false;
+    const down = () => {
+      held = false;
+      holdTimer = setTimeout(() => {
+        held = true;
+        const track = deckTrackObj(id);
+        if (track) send({ type: 'cue-set', trackId: track.id, slot: i, position: null });
+      }, 600);
+    };
+    const up = () => clearTimeout(holdTimer);
+    b.addEventListener('pointerdown', down);
+    b.addEventListener('pointerup', up);
+    b.addEventListener('pointerleave', up);
+    b.addEventListener('contextmenu', (e) => e.preventDefault());
+    b.addEventListener('click', () => {
+      if (held) return;
+      const track = deckTrackObj(id);
+      if (!track) return;
+      const cueVal = track.cues ? track.cues[i] : null;
+      if (cueVal == null) {
+        send({ type: 'cue-set', trackId: track.id, slot: i, position: Math.max(0, deckUiPosition(id)) });
+      } else {
+        send({ type: 'deck-seek', deck: id, position: cueVal });
+      }
+    });
+  }
+}
+
+function wireDecks() {
+  $('btn-decks').addEventListener('click', () => {
+    send({ type: 'decks-mode', on: !(E.S.decks && E.S.decks.on) });
+  });
+  wireStrip('A');
+  wireStrip('B');
+  const xf = $('xfader');
+  xf.addEventListener('input', () => sendXfader(Number(xf.value) / 100));
+  xf.addEventListener('dblclick', () => {
+    xf.value = '0';
+    sendXfader(0, true);
+  });
 }
 
 function wire() {
@@ -474,6 +687,8 @@ function wire() {
     sendFx(true);
     renderFxControls();
   });
+
+  wireDecks();
 }
 
 // ------------------------------------------------------------------- hooks --
@@ -501,12 +716,35 @@ export function onFx() {
   renderFxControls();
 }
 
-// 250 ms UI tick from main.js. The deck normally animates on its own rAF;
-// drawing it here too guarantees ≥4 fps when rAF is throttled or starved
-// (backgrounded webviews, battery savers) — the draw is a cheap blit.
+// Decks snapshot changed (mode toggle, load, play/pause, rate, sync).
+export function onDecks() {
+  if (!E) return;
+  renderDecks();
+  renderCues();
+  pump(); // deck tracks may need a peaks pass
+}
+
+// Crossfader echoed back (ours, another lead session, or late-join catch-up).
+export function onXfader() {
+  if (!E) return;
+  const xf = $('xfader');
+  if (xf && document.activeElement !== xf && !xfPending && E.S.decks) {
+    xf.value = String(Math.round((E.S.decks.xfader || 0) * 100));
+  }
+}
+
+// 250 ms UI tick from main.js. The deck views normally animate on their own
+// rAF; drawing here too guarantees ≥4 fps when rAF is throttled or starved
+// (backgrounded webviews, battery savers) — the draws are cheap blits.
 export function tick() {
   if (!E || E.S.role !== 'lead') return;
   renderBpmLine();
   const mix = $('mix');
-  if (mix && mix.open) drawDeck();
+  if (!mix || !mix.open) return;
+  if (E.S.decks && E.S.decks.on) {
+    drawStrip('A');
+    drawStrip('B');
+  } else {
+    drawDeck();
+  }
 }

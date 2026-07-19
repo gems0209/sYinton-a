@@ -1,6 +1,6 @@
 # sYntonia
 
-Turn a group of smartphones into one distributed sound system: a **lead** device uploads tracks into a queue, the others join with a 4-char code (or the shared session URL) and every speaker plays them in tight sync — auto-advancing through the playlist with repeat, shuffle and DJ-style **MIX MODE** transitions (BPM analysis, beatmatched crossfades, live EQ/filter/tempo).
+Turn a group of smartphones into one distributed sound system: a **lead** device uploads tracks into a queue, the others join with a 4-char code (or the shared session URL) and every speaker plays them in tight sync — auto-advancing through the playlist with repeat, shuffle and DJ-style **MIX MODE** transitions (BPM analysis, beatmatched crossfades, live EQ/filter/tempo), plus a manual **DUAL DECK** mode (two simultaneous timelines, crossfader, per-deck pitch and SYNC).
 
 Node + Express + `ws` on the server, vanilla ES modules + Web Audio API on the client. No database, no build step, no frameworks. UI in Italian (EN switch in the header).
 
@@ -87,6 +87,39 @@ render the effects that arrive over the protocol.
   both server and clients. Drift correction pauses during rate glides and
   resumes on the next constant-rate heartbeat.
 
+## DUAL DECK (lead-only, in the MIX panel)
+
+Virtual-DJ-style manual mixing under the same sync contract: **two independent
+server timelines (deck A and deck B), both playing at once on every device**,
+mixed by an equal-power crossfader. DECKS is a mode: while it's on, the queue
+transport and auto-advance are suspended (the queue itself is untouched and
+resumes, stopped, when you switch back). The automix transition engine is not
+involved at all.
+
+- **Load from the queue.** In DECKS mode every queue row grows `A`/`B`
+  buttons; a deck can be (re)loaded any time it isn't playing. Removing the
+  row unloads the deck. Both deck tracks join the prefetch set, so every
+  client keeps them decoded; per-deck PLAY is gated on readiness like the
+  queue's PLAY. Entering DECKS while the queue plays **adopts** the playing
+  track as deck A with the exact same timeline — zero glitch, since clients
+  already render the queue on channel A.
+- **Per-deck controls**: PLAY/PAUSE, tap-to-seek on the strip waveform, the
+  track's 4 hot cues, **pitch ±8 %** (server re-anchors, clients glide
+  `playbackRate` — no restart) and **SYNC**: the server sets this deck's rate
+  so the effective BPMs match (octave folding, refused with a soft error
+  outside the pitch range) and phase-aligns the beat grids with a
+  nearest-beat micro-seek (≤ half a beat, rendered as a 60 ms crossfade).
+- **Crossfader**: −1 = only A, +1 = only B, cos/sin equal-power law, streamed
+  like the fx (throttled, applied everywhere at a server-fixed instant ~0.3 s
+  ahead; double-tap recenters). The global EQ/filter sits after the mix and
+  stays live; the calibration click is refused in DECKS mode (calibrate in
+  queue mode).
+- **One reconciler.** Every deck mutation is answered with a single
+  `decks-update` snapshot (plus a `glide` hint for pitch-only changes);
+  clients reconcile their two channels against it — the same code path serves
+  live updates, late join and self-heal. Heartbeats carry both timelines and
+  drift is corrected per channel.
+
 ## WebSocket protocol
 
 All session messages carry `sessionCode`; transport messages from satellites are ignored; malformed JSON never crashes the server.
@@ -109,8 +142,13 @@ All session messages carry `sessionCode`; transport messages from satellites are
 | `set-tempo` / `rate-change` | C→S / S→C | `tempo` ⇄ `rate`, `trackOffset`, `applyAtServerTime` |
 | `fx-set` / `fx-update` | C→S / S→C | EQ dB + kills + `filter` ⇄ same + `applyAtServerTime` |
 | `cue-set` | C→S | `trackId`, `slot` 0-3, `position` (null clears) |
-| `click-start` / `click-stop` | C→S | calibration click track |
-| `position-heartbeat` | S→C | `serverTime`, `trackPosition`, `rate`, `rampActive` (5 s) |
+| `decks-mode` | C→S | `on: bool` (on adopts a playing queue track as deck A) |
+| `deck-load` / `deck-play` / `deck-pause` / `deck-seek` | C→S | `deck: A\|B` + `trackId` / `position` / `force` |
+| `deck-rate` / `deck-sync` | C→S | per-deck pitch 0.92–1.08 / BPM+phase match onto the other deck |
+| `xfader` / `xfader-update` | C→S / S→C | `x: −1..1` ⇄ same + `applyAtServerTime` |
+| `decks-update` | S→C | full decks snapshot (+ `glide` hint on pitch-only changes) |
+| `click-start` / `click-stop` | C→S | calibration click track (refused in DECKS mode) |
+| `position-heartbeat` | S→C | `serverTime`, `trackPosition`, `rate`, `rampActive`, `decks{A,B}` (5 s) |
 | `position-request` | C→S | immediate heartbeat (after foregrounding) |
 | `timesync` | C↔S | `t0` ⇄ `t0`, `tServer` |
 | `session-ended` / `leave` | S→C / C→S | — |

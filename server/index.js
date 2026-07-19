@@ -96,6 +96,8 @@ app.post('/upload/:sessionCode', upload.single('audio'), (req, res) => {
     originalName: file.originalname,
     size: file.size,
     duration: null, // clients report it after decoding
+    meta: null,     // {bpm, confidence, beatPhase, gainDb} — reported by the lead's analysis
+    cues: [null, null, null, null], // hot cue positions (seconds)
     addedAt: Date.now(),
   };
   session.queue.push(track);
@@ -138,25 +140,41 @@ function sendError(ws, code, text) {
 }
 
 // Scheduled start of a track: fix an instant far enough in the future that
-// every client can schedule the exact same sample. `leadMs` is normally the
-// standard 1.5 s; the auto-advance ticker passes the exact remaining time of
-// the outgoing track so the next one starts gaplessly when it ends.
-function startTrack(session, trackId, fromPosition = 0, leadMs = S.PLAY_LEAD_TIME_MS, click = false) {
+// every client can schedule the exact same sample. Options:
+//   from       start position in the track (s)
+//   leadMs     schedule this far ahead (default 1.5 s) — ignored if startAt set
+//   startAt    absolute server time of the start (transitions compute this)
+//   click      calibration click track (queue untouched)
+//   rate       playback rate of the new track (default: session master tempo)
+//   ramp       {to, startAt, dur} — rate glide after a beatmatch overlap
+//   transition {type:'fade'|'beatmatch', dur} — how the OUTGOING source exits:
+//              clients overlap it for `dur` seconds with an equal-power fade
+//              (beatmatch adds an EQ swap) instead of cutting it at the handover.
+function startTrack(session, trackId, opts = {}) {
+  const {
+    from = 0, leadMs = S.PLAY_LEAD_TIME_MS, startAt = null,
+    click = false, rate = null, ramp = null, transition = null,
+  } = opts;
   session.currentTrackId = click ? session.currentTrackId : trackId;
   session.advanceWaitSince = null;
   session.playback = {
     status: 'playing',
-    trackOffset: fromPosition,
-    startAtServerTime: now() + leadMs,
+    trackOffset: from,
+    startAtServerTime: startAt !== null ? startAt : now() + leadMs,
     pausedPosition: 0,
     click,
+    rate: click ? 1 : (rate !== null ? rate : session.tempo),
+    rateRamp: click ? null : ramp,
   };
   S.broadcast(session, {
     type: 'track-change',
     trackId: click ? null : trackId,
     startAtServerTime: session.playback.startAtServerTime,
-    trackOffset: fromPosition,
+    trackOffset: from,
     click,
+    rate: session.playback.rate,
+    rateRamp: session.playback.rateRamp,
+    transition,
   });
   if (!click) {
     S.broadcastQueue(session); // current/next moved
@@ -164,8 +182,93 @@ function startTrack(session, trackId, fromPosition = 0, leadMs = S.PLAY_LEAD_TIM
   }
 }
 
+// ---------------------------------------------------------- transitions ----
+// Decide how the next track enters, honoring the session transition mode and
+// degrading gracefully: beatmatch needs confident BPM on both sides, a ratio
+// within ±8% after octave folding, and no rate glide already in progress —
+// anything else becomes a plain 4 s crossfade.
+function planTransitionType(session, outTrack, nextTrack) {
+  const mode = session.transitionMode;
+  if (mode !== 'beatmatch') {
+    const fade = S.TRANSITION_FADE_S[mode] || 0;
+    return { type: fade > 0 ? 'fade' : 'cut', fade };
+  }
+  const mOut = outTrack && outTrack.meta;
+  const mIn = nextTrack && nextTrack.meta;
+  if (!mOut || !mIn || !mOut.bpm || !mIn.bpm
+    || mOut.confidence < 0.2 || mIn.confidence < 0.2 || session.playback.rateRamp) {
+    return { type: 'fade', fade: 4 };
+  }
+  let ratio = mOut.bpm / mIn.bpm;
+  while (ratio > 1.5) ratio /= 2;      // 140 vs 70: treat as half/double time
+  while (ratio < 1 / 1.5) ratio *= 2;
+  if (Math.abs(ratio - 1) > S.BEATMATCH_MAX_DEV) return { type: 'fade', fade: 4 };
+  const rateOut = S.currentRate(session);
+  // 16 beats of the outgoing track (wall clock), clamped to a sane 4–10 s.
+  const fade = Math.min(10, Math.max(4, (16 * 60 / mOut.bpm) / rateOut));
+  return {
+    type: 'beatmatch', fade, ratio,
+    bpmOut: mOut.bpm, phaseOut: mOut.beatPhase || 0, phaseIn: mIn.beatPhase || 0,
+  };
+}
+
+// Start `nextId` OVER the tail of the current track. Auto (queue advance): the
+// incoming start is placed fade seconds before the outgoing track's end, so the
+// crossfade finishes exactly as the old track runs out. Manual (skip): the fade
+// starts ~1.5 s from now, djay-style. Beatmatch also (a) snaps the start onto
+// the outgoing beat grid, (b) starts the incoming track ON its first detected
+// beat at a rate that matches the outgoing tempo, and (c) glides that rate back
+// to the master tempo once the overlap is done.
+function startTransition(session, nextId, { manual = false } = {}) {
+  const outTrack = S.currentTrack(session);
+  const nextTrack = S.getTrack(session, nextId);
+  const rateOut = S.currentRate(session);
+  const plan = planTransitionType(session, outTrack, nextTrack);
+  const tEnd = outTrack && outTrack.duration
+    ? now() + Math.max(0, (outTrack.duration - S.position(session)) / rateOut) * 1000
+    : null;
+
+  let startAt;
+  if (manual || tEnd === null) {
+    startAt = now() + S.PLAY_LEAD_TIME_MS;
+  } else {
+    startAt = tEnd - plan.fade * 1000;
+    const minAt = now() + 250;
+    if (startAt < minAt) startAt = minAt; // triggered late: shrink the overlap
+  }
+
+  if (plan.type === 'beatmatch') {
+    const beatLen = 60 / plan.bpmOut;
+    const posC = S.positionAt(session, startAt);
+    let k = Math.ceil((posC - plan.phaseOut) / beatLen - 1e-6);
+    let posBeat = plan.phaseOut + k * beatLen;
+    if (outTrack.duration && posBeat > outTrack.duration - 0.05 && k > 0) posBeat -= beatLen;
+    if (posBeat > posC) startAt += ((posBeat - posC) / rateOut) * 1000;
+    let from = plan.phaseIn;
+    if (nextTrack && nextTrack.duration && from >= nextTrack.duration) from = 0;
+    const rate = rateOut * plan.ratio;
+    const dur = manual || tEnd === null
+      ? plan.fade
+      : Math.max(0.5, (tEnd - startAt) / 1000);
+    const ramp = Math.abs(rate - session.tempo) > 0.0005
+      ? { to: session.tempo, startAt: startAt + dur * 1000, dur: S.BEATMATCH_RAMP_MS }
+      : null;
+    startTrack(session, nextId, { from, startAt, rate, ramp, transition: { type: 'beatmatch', dur } });
+    return;
+  }
+
+  const dur = manual || tEnd === null ? plan.fade : Math.max(0, (tEnd - startAt) / 1000);
+  startTrack(session, nextId, {
+    startAt,
+    transition: plan.type === 'fade' && dur > 0.05 ? { type: 'fade', dur } : null,
+  });
+}
+
 function stopPlayback(session, ended = false) {
-  session.playback = { status: 'idle', trackOffset: 0, startAtServerTime: 0, pausedPosition: 0, click: false };
+  session.playback = {
+    status: 'idle', trackOffset: 0, startAtServerTime: 0, pausedPosition: 0, click: false,
+    rate: 1, rateRamp: null,
+  };
   session.advanceWaitSince = null;
   S.broadcast(session, { type: 'stop', ended });
 }
@@ -286,7 +389,7 @@ const HANDLERS = {
     const track = S.getTrack(session, target);
     let from = typeof msg.position === 'number' ? Math.max(0, msg.position) : S.position(session);
     if (track.duration && from >= track.duration) from = 0; // resume past end → restart
-    startTrack(session, target, from);
+    startTrack(session, target, { from });
   },
 
   pause(ws, msg, session, client) {
@@ -295,7 +398,11 @@ const HANDLERS = {
     let pos = S.position(session);
     const track = S.currentTrack(session);
     if (track && track.duration) pos = Math.min(pos, track.duration);
-    session.playback = { status: 'paused', trackOffset: 0, startAtServerTime: 0, pausedPosition: pos, click: false };
+    // Any beatmatch glide dies with the pause; resume restarts at master tempo.
+    session.playback = {
+      status: 'paused', trackOffset: 0, startAtServerTime: 0, pausedPosition: pos, click: false,
+      rate: session.tempo, rateRamp: null,
+    };
     session.advanceWaitSince = null;
     S.broadcast(session, { type: 'pause', position: pos });
   },
@@ -313,7 +420,7 @@ const HANDLERS = {
     let pos = Math.max(0, msg.position);
     if (track.duration) pos = Math.min(pos, track.duration - 0.05);
     if (session.playback.status === 'playing' && !session.playback.click) {
-      startTrack(session, track.id, pos); // seek = stop + new scheduled play
+      startTrack(session, track.id, { from: pos }); // seek = stop + new scheduled play
     } else if (session.playback.status !== 'idle') {
       session.playback.pausedPosition = pos;
       session.playback.status = 'paused';
@@ -325,7 +432,14 @@ const HANDLERS = {
     if (client.role !== 'lead') return;
     const next = S.resolveNextId(session, { manual: true });
     if (!next) return stopPlayback(session);
-    startTrack(session, next);
+    // A manual skip honors the active transition (djay-style: the fade starts
+    // now instead of at the track's end). CUT keeps the classic jump.
+    const playing = session.playback.status === 'playing' && !session.playback.click;
+    if (playing && session.transitionMode !== 'cut') {
+      startTransition(session, next, { manual: true });
+    } else {
+      startTrack(session, next);
+    }
   },
 
   // Standard player convention: >3 s into the track, "prev" restarts it;
@@ -390,11 +504,94 @@ const HANDLERS = {
     S.broadcastQueue(session); // current track is untouched, only "next" moves
   },
 
+  // ---- MIX MODE: lead-only, like the transport. --------------------------
+  // BPM/beatgrid analysis result from the lead's DJ module.
+  'track-meta'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    const track = S.getTrack(session, msg.trackId);
+    if (!track) return;
+    const num = (v, min, max) => (typeof v === 'number' && isFinite(v) && v >= min && v <= max ? v : null);
+    track.meta = {
+      bpm: num(msg.bpm, 40, 250),
+      confidence: num(msg.confidence, 0, 1) ?? 0,
+      beatPhase: num(msg.beatPhase, 0, 60) ?? 0,
+      gainDb: num(msg.gainDb, -60, 24),
+    };
+    S.broadcastQueue(session);
+  },
+
+  'set-transition'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    if (!S.TRANSITION_MODES.includes(msg.mode)) return;
+    session.transitionMode = msg.mode; // takes effect at the next track change
+    S.broadcastQueue(session);
+  },
+
+  // Master tempo: re-anchor the timeline at a shared future instant and let
+  // every client glide playbackRate locally (~0.15 s) — no restart, no click.
+  // During a beatmatch glide the live change is skipped (the ramp's integral
+  // would diverge between server and clients); the stored tempo still applies
+  // from the next track on.
+  'set-tempo'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    if (typeof msg.tempo !== 'number' || !isFinite(msg.tempo)) return;
+    const tempo = Math.min(S.TEMPO_MAX, Math.max(S.TEMPO_MIN, msg.tempo));
+    session.tempo = tempo;
+    const p = session.playback;
+    if (p.status === 'playing' && !p.click && !p.rateRamp && p.rate !== tempo) {
+      const applyAt = now() + S.FX_APPLY_LEAD_MS;
+      p.trackOffset = S.positionAt(session, applyAt);
+      p.startAtServerTime = applyAt;
+      p.rate = tempo;
+      S.broadcast(session, {
+        type: 'rate-change', rate: tempo, trackOffset: p.trackOffset, applyAtServerTime: applyAt,
+      });
+    }
+    S.broadcastQueue(session); // tempo rides in the snapshot
+  },
+
+  // Live EQ/filter state. Stored (late joiners pick it up from the queue
+  // snapshot) and broadcast with a shared future apply instant so every device
+  // changes sound at the same moment.
+  'fx-set'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    const f = msg.fx || {};
+    const num = (v, min, max, dflt) => (typeof v === 'number' && isFinite(v) ? Math.min(max, Math.max(min, v)) : dflt);
+    session.fx = {
+      low: num(f.low, -40, 6, 0),
+      mid: num(f.mid, -40, 6, 0),
+      high: num(f.high, -40, 6, 0),
+      killLow: !!f.killLow,
+      killMid: !!f.killMid,
+      killHigh: !!f.killHigh,
+      filter: num(f.filter, -100, 100, 0),
+    };
+    S.broadcast(session, { type: 'fx-update', fx: session.fx, applyAtServerTime: now() + S.FX_APPLY_LEAD_MS });
+  },
+
+  // Hot cues: per-track, session-lived. position:null clears the slot.
+  'cue-set'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    const track = S.getTrack(session, msg.trackId);
+    if (!track) return;
+    if (!Number.isInteger(msg.slot) || msg.slot < 0 || msg.slot > 3) return;
+    if (!track.cues) track.cues = [null, null, null, null];
+    if (msg.position === null) {
+      track.cues[msg.slot] = null;
+    } else {
+      if (typeof msg.position !== 'number' || !isFinite(msg.position)) return;
+      let pos = Math.max(0, msg.position);
+      if (track.duration) pos = Math.min(pos, Math.max(0, track.duration - 0.1));
+      track.cues[msg.slot] = pos;
+    }
+    S.broadcastQueue(session);
+  },
+
   // Calibration click track — generated locally by every client, scheduled
   // like a normal track; the queue is untouched.
   'click-start'(ws, msg, session, client) {
     if (client.role !== 'lead') return;
-    startTrack(session, null, 0, S.PLAY_LEAD_TIME_MS, true);
+    startTrack(session, null, { click: true });
   },
 
   'click-stop'(ws, msg, session, client) {
@@ -411,6 +608,8 @@ const HANDLERS = {
       serverTime: now(),
       trackPosition: S.position(session),
       status: session.playback.status,
+      rate: S.currentRate(session),
+      rampActive: !!session.playback.rateRamp,
     });
   },
 
@@ -429,6 +628,7 @@ const HANDLERS = {
 const SESSION_SCOPED = new Set([
   'client-ready', 'play', 'pause', 'stop', 'seek',
   'skip-next', 'skip-prev', 'queue-remove', 'queue-reorder', 'set-repeat', 'set-shuffle',
+  'track-meta', 'set-transition', 'set-tempo', 'fx-set', 'cue-set',
   'click-start', 'click-stop', 'position-request', 'leave',
 ]);
 
@@ -476,14 +676,20 @@ wss.on('connection', (ws) => {
 // after ADVANCE_WAIT_MS with whoever is ready.
 setInterval(() => {
   for (const session of S.sessions.values()) {
+    S.commitRateRamp(session); // fold finished beatmatch glides back to constant rate
     const p = session.playback;
     if (p.status !== 'playing' || p.click) continue;
     const track = S.currentTrack(session);
     if (!track || !track.duration) continue;
-    const remainingMs = (track.duration - S.position(session)) * 1000;
-    if (remainingMs > S.PLAY_LEAD_TIME_MS + 300) continue;
-
+    // Remaining WALL-CLOCK time: at rate r the track burns r seconds of audio
+    // per second. Crossfades widen the trigger window by the fade length so the
+    // incoming track can start fade seconds BEFORE the outgoing one ends.
+    const rate = S.currentRate(session);
+    const remainingMs = ((track.duration - S.position(session)) / rate) * 1000;
     const nextId = S.resolveNextId(session);
+    const plan = planTransitionType(session, track, nextId ? S.getTrack(session, nextId) : null);
+    if (remainingMs > plan.fade * 1000 + S.PLAY_LEAD_TIME_MS + 300) continue;
+
     if (!nextId) {
       // End of the queue: let it run out, then stop cleanly.
       if (remainingMs <= -750) stopPlayback(session, true);
@@ -494,9 +700,12 @@ setInterval(() => {
       if (!session.advanceWaitSince) session.advanceWaitSince = Date.now();
       if (Date.now() - session.advanceWaitSince < S.ADVANCE_WAIT_MS) continue; // hold
     }
-    // Gapless when possible: start the next track at the outgoing track's end.
-    const leadMs = Math.max(remainingMs, everyoneReady ? 250 : S.PLAY_LEAD_TIME_MS);
-    startTrack(session, nextId, 0, leadMs);
+    if (remainingMs <= 300) {
+      // Ran out (buffering hold, or cut mode at the wire): classic gapless jump.
+      startTrack(session, nextId, { leadMs: Math.max(remainingMs, everyoneReady ? 250 : S.PLAY_LEAD_TIME_MS) });
+    } else {
+      startTransition(session, nextId); // cut → fade 0 → same instant as before
+    }
   }
 }, 250);
 
@@ -510,6 +719,8 @@ setInterval(() => {
       serverTime: now(),
       trackPosition: S.position(session),
       status: 'playing',
+      rate: S.currentRate(session),
+      rampActive: !!session.playback.rateRamp,
     });
   }
 }, 5000);

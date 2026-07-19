@@ -33,17 +33,24 @@ const S = {
   clientId: getClientId(),
   role: null,          // 'lead' | 'satellite'
   code: null,
-  queue: [],           // [{id, name, duration, size}]
+  queue: [],           // [{id, name, duration, size, meta, cues}]
   currentTrackId: null,
   nextTrackId: null,
   prefetch: [],        // track ids the server wants decoded on this device
   repeatMode: 'off',
   shuffle: false,
+  transitionMode: 'cut', // MIX: how the queue moves from track to track
+  tempo: 1,              // MIX: master tempo (0.92..1.08)
+  fx: null,              // MIX: live EQ/filter state (server-owned)
   playback: { status: 'idle' },
   peers: [],
   wakeLock: null,
   forceTimer: null,
 };
+
+// MIX MODE module (analysis, deck, mix panel) — lazily imported on the LEAD
+// only; satellites never download it, they just render the received effects.
+let dj = null;
 
 // Shareable session URL: /5CEG → prefill the code and auto-join as satellite.
 function urlSessionCode() {
@@ -151,7 +158,12 @@ function ensurePlaying() {
   armThen(() => {
     if (S.playback.status === 'playing' && !player.playing) {
       player.setBuffer(buf);
-      schedulePlayback(S.playback.startAtServerTime, S.playback.trackOffset, false);
+      // Clean re-entry onto the authoritative timeline (no transition: the
+      // outgoing source this device might have missed is gone anyway).
+      schedulePlayback(S.playback.startAtServerTime, S.playback.trackOffset, false, {
+        rate: S.playback.rate ?? 1,
+        ramp: S.playback.rateRamp || null,
+      });
     }
   });
 }
@@ -177,6 +189,7 @@ onLangChange(() => {
   renderQueue();
   $('btn-cal-lock').textContent = t($('cal').disabled ? 'cal_unlock' : 'cal_lock');
   $('net-status').textContent = ws.open ? t('connected') : t('reconnecting');
+  if (dj) dj.onQueue(); // MIX labels re-render
 });
 
 // ------------------------------------------------------------------ home ---
@@ -281,23 +294,54 @@ ws.on('queue-update', (msg) => {
 
 // Track change (queue advance, skip, seek, play): the server fixed the start
 // instant; swap the buffer and schedule. The outgoing source keeps playing
-// until the handover (gapless).
+// until the handover (gapless cut) or across the whole crossfade (MIX
+// transitions ride in msg.transition; rate/rateRamp carry beatmatch tempo).
 ws.on('track-change', (msg) => {
   S.playback = {
     status: 'playing',
     click: msg.click,
     startAtServerTime: msg.startAtServerTime,
     trackOffset: msg.trackOffset,
+    rate: msg.rate ?? 1,
+    rateRamp: msg.rateRamp || null,
   };
   if (!msg.click) S.currentTrackId = msg.trackId;
   const buf = msg.click ? null : bufferCache.get(msg.trackId);
   if (msg.click || buf) {
     if (buf) player.setBuffer(buf);
-    schedulePlayback(msg.startAtServerTime, msg.trackOffset, !!msg.click);
+    schedulePlayback(msg.startAtServerTime, msg.trackOffset, !!msg.click, {
+      rate: msg.rate ?? 1,
+      ramp: msg.rateRamp || null,
+      transition: msg.transition || null,
+    });
   }
   // else: still decoding — ensurePlaying() fires after the decode completes.
   renderStatus();
   renderQueue();
+});
+
+// MIX: master tempo changed mid-play — the server re-anchored its timeline,
+// every client glides playbackRate at the same instant.
+ws.on('rate-change', (msg) => {
+  if (typeof msg.rate !== 'number') return;
+  if (S.playback.status === 'playing') {
+    S.playback.rate = msg.rate;
+    S.playback.rateRamp = null;
+    S.playback.trackOffset = msg.trackOffset;
+    S.playback.startAtServerTime = msg.applyAtServerTime;
+  }
+  player.setRate(msg.rate, msg.trackOffset, msg.applyAtServerTime);
+});
+
+// MIX: live EQ/filter — rendered identically by lead and satellites.
+ws.on('fx-update', (msg) => {
+  if (!msg.fx) return;
+  S.fx = msg.fx;
+  const applyCtx = player.ctx
+    ? player.ctxTimeFor(clock.serverToLocal(msg.applyAtServerTime || 0))
+    : 0;
+  player.setFx(msg.fx, applyCtx);
+  if (dj) dj.onFx();
 });
 
 ws.on('pause', (msg) => {
@@ -315,7 +359,7 @@ ws.on('stop', () => {
 
 ws.on('position-heartbeat', (msg) => {
   if (msg.status && msg.status !== 'playing') return;
-  player.checkDrift(msg.serverTime, msg.trackPosition);
+  player.checkDrift(msg.serverTime, msg.trackPosition, msg.rate ?? 1, !!msg.rampActive);
   ensurePlaying();
   renderTech();
 });
@@ -329,9 +373,9 @@ ws.on('session-ended', () => {
 // Schedule against the shared clock; if the clock is not synced yet (play can
 // race the first burst), sync first. Then ask for an immediate authoritative
 // position so any residual error is corrected now, not at the next 5 s beat.
-async function schedulePlayback(startAtServerTime, trackOffset, click) {
+async function schedulePlayback(startAtServerTime, trackOffset, click, opts = {}) {
   if (!clock.synced) await clock.burst(10);
-  player.scheduleAt(startAtServerTime, trackOffset, click);
+  player.scheduleAt(startAtServerTime, trackOffset, click, 0, opts);
   if (!click) ws.send({ type: 'position-request', sessionCode: S.code });
 }
 
@@ -349,10 +393,18 @@ function applyQueueUpdate(msg) {
   S.prefetch = msg.prefetch || [];
   S.repeatMode = msg.repeatMode;
   S.shuffle = msg.shuffle;
+  if (msg.transitionMode) S.transitionMode = msg.transitionMode;
+  if (typeof msg.tempo === 'number') S.tempo = msg.tempo;
+  if (msg.fx && JSON.stringify(msg.fx) !== JSON.stringify(S.fx)) {
+    // Late join / reconnect: pick up the session's live EQ/filter state.
+    S.fx = msg.fx;
+    player.setFx(msg.fx, 0);
+  }
   renderQueue();
   renderTrack();
   renderStatus();
   ensureBuffers();
+  if (dj) dj.onQueue();
 }
 
 async function ensureBuffers() {
@@ -397,6 +449,14 @@ function enterSession(code, role, queueSnapshot, playback, peers) {
   if (role === 'lead') {
     $('lead-code').textContent = code;
     showView('lead');
+    // MIX MODE tools load only here — satellites never fetch the module.
+    if (!dj) {
+      import('./dj.js')
+        .then((m) => { dj = m; dj.init({ S, ws, player, bufferCache, flash }); })
+        .catch(() => { /* MIX tools are optional: playback works without them */ });
+    } else {
+      dj.onQueue();
+    }
   } else {
     $('sat-code').textContent = code;
     showView('sat');
@@ -570,11 +630,16 @@ function renderQueue() {
       const mark = track.id === S.currentTrackId ? '▶' : (track.id === S.nextTrackId ? '›' : '');
       const state = bufferCache.has(track.id) ? '' : (decoding.has(track.id) ? '…' : '');
       const dur = track.duration ? fmtTime(track.duration) : '--:--';
+      // BPM chip from the lead's analysis (MIX MODE); low confidence shows ~.
+      const bpm = track.meta && track.meta.bpm
+        ? `${track.meta.confidence < 0.2 ? '~' : ''}${Math.round(track.meta.bpm)}`
+        : '';
       li.innerHTML =
         `<span class="q-mark">${mark}</span>` +
         `<span class="q-num num">${String(i + 1).padStart(2, '0')}</span>` +
         `<span class="q-name">${track.name.toUpperCase()}</span>` +
         `<span class="q-state">${state}</span>` +
+        (bpm ? `<span class="q-bpm num">${bpm}</span>` : '') +
         `<span class="q-dur num">${dur}</span>`;
       if (isLead) {
         const controls = document.createElement('span');
@@ -659,6 +724,7 @@ setInterval(() => {
     progress.setAttribute('aria-valuenow', Math.round(frac * 100));
     $('time-cur').textContent = fmtTime(pos);
   }
+  if (dj) dj.tick();
   renderTech();
 }, 250);
 

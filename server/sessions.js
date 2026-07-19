@@ -25,6 +25,19 @@ const TRANSITION_MODES = ['cut', 'fade2', 'fade4', 'fade8', 'beatmatch'];
 const TRANSITION_FADE_S = { cut: 0, fade2: 2, fade4: 4, fade8: 8 };
 const NEUTRAL_FX = () => ({ low: 0, mid: 0, high: 0, killLow: false, killMid: false, killHigh: false, filter: 0 });
 
+// ---- DUAL DECK constants ----------------------------------------------------
+const DECK_IDS = ['A', 'B'];
+const DECK_PLAY_LEAD_MS = 900;           // deck actions feel snappier than queue PLAY, still sync-safe
+const newDeck = () => ({
+  trackId: null,
+  status: 'empty',      // 'empty' | 'loaded' | 'playing' | 'paused' | 'ended'
+  trackOffset: 0,
+  startAtServerTime: 0,
+  pausedPosition: 0,
+  rate: 1,              // per-deck pitch (0.92..1.08); no ramps on decks (v1)
+  rateRamp: null,       // kept for shape-compatibility with the timeline math
+});
+
 const UPLOAD_ROOT = path.join(__dirname, '..', 'uploads');
 
 const sessions = new Map(); // code -> session
@@ -68,6 +81,10 @@ function create(leadClientId) {
       rate: 1,
       rateRamp: null,     // { to, startAt (serverTime ms), dur (ms) }
     },
+    // DUAL DECK mode: two independent timelines mixed by a crossfader. While
+    // decks.on the queue transport and auto-advance are suspended (the queue
+    // itself stays intact and resumes, stopped, when decks are turned off).
+    decks: { on: false, xfader: 0, A: newDeck(), B: newDeck() },
     advanceWaitSince: null, // set while waiting for clients to buffer the next track
     orphanTimer: null,
     lastActivity: Date.now(),
@@ -152,14 +169,15 @@ function gateTrackId(session) {
   return session.currentTrackId || effectiveOrder(session)[0] || null;
 }
 
-// Authoritative track position in seconds, derived from the server clock.
-// With a playback rate r, position advances at r seconds of audio per second
-// of wall clock; during a linear rate ramp the advance is the integral of the
-// ramp (quadratic segment) — exact, so heartbeats stay truthful mid-ramp.
-function positionAt(session, serverTimeMs) {
-  const p = session.playback;
+// Authoritative position in seconds of ANY timeline (queue playback or a
+// deck), derived from the server clock. With a playback rate r, position
+// advances at r seconds of audio per second of wall clock; during a linear
+// rate ramp the advance is the integral of the ramp (quadratic segment) —
+// exact, so heartbeats stay truthful mid-ramp. Decks never carry ramps but
+// share the same shape (rateRamp: null).
+function timelinePositionAt(p, serverTimeMs) {
   if (p.status === 'paused') return p.pausedPosition;
-  if (p.status !== 'playing') return 0;
+  if (p.status !== 'playing') return p.pausedPosition || 0;
   const t = Math.max(0, (serverTimeMs - p.startAtServerTime) / 1000); // wall seconds since anchor
   const r = p.rateRamp;
   if (!r) return p.trackOffset + t * p.rate;
@@ -174,8 +192,16 @@ function positionAt(session, serverTimeMs) {
   return pos;
 }
 
+function positionAt(session, serverTimeMs) {
+  return timelinePositionAt(session.playback, serverTimeMs);
+}
+
 function position(session) {
   return positionAt(session, now());
+}
+
+function deckPosition(session, deckId, serverTimeMs = now()) {
+  return timelinePositionAt(session.decks[deckId], serverTimeMs);
 }
 
 // The instantaneous rate right now (mid-ramp included) — used by the ticker to
@@ -202,6 +228,29 @@ function commitRateRamp(session) {
   p.startAtServerTime = end;
   p.rate = r.to;
   p.rateRamp = null;
+}
+
+// Full decks state, broadcast on every deck mutation and included in the
+// queue snapshot for late joiners.
+function decksSnapshot(session) {
+  const d = session.decks;
+  const one = (id) => {
+    const deck = d[id];
+    return {
+      trackId: deck.trackId,
+      status: deck.status,
+      trackOffset: deck.trackOffset,
+      startAtServerTime: deck.startAtServerTime,
+      pausedPosition: deck.pausedPosition,
+      rate: deck.rate,
+      position: deckPosition(session, id),
+    };
+  };
+  return { on: d.on, xfader: d.xfader, A: one('A'), B: one('B'), serverTime: now() };
+}
+
+function broadcastDecks(session) {
+  broadcast(session, { type: 'decks-update', decks: decksSnapshot(session) });
 }
 
 function playbackSnapshot(session) {
@@ -243,12 +292,18 @@ function queueSnapshot(session) {
     repeatMode: session.repeatMode,
     shuffle: session.shuffle,
     order,
-    prefetch: [...new Set([gate, next].filter(Boolean))],
+    // Clients keep decoded exactly what this lists: queue gate + next, plus
+    // any track sitting on a deck (both decks must be playable at any time).
+    prefetch: [...new Set([
+      gate, next,
+      session.decks.A.trackId, session.decks.B.trackId,
+    ].filter(Boolean))],
     // MIX session settings ride along: late joiners (and a reloading lead)
     // restore transition mode, tempo and the live FX state from here.
     transitionMode: session.transitionMode,
     tempo: session.tempo,
     fx: session.fx,
+    decks: decksSnapshot(session),
   };
 }
 
@@ -319,6 +374,10 @@ module.exports = {
   gateTrackId,
   position,
   positionAt,
+  timelinePositionAt,
+  deckPosition,
+  decksSnapshot,
+  broadcastDecks,
   currentRate,
   commitRateRamp,
   playbackSnapshot,
@@ -342,4 +401,7 @@ module.exports = {
   FX_APPLY_LEAD_MS,
   TRANSITION_MODES,
   TRANSITION_FADE_S,
+  DECK_IDS,
+  DECK_PLAY_LEAD_MS,
+  newDeck,
 };

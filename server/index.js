@@ -280,6 +280,10 @@ function allConnectedReadyFor(session, trackId) {
   return true;
 }
 
+function deckOf(session, id) {
+  return S.DECK_IDS.includes(id) ? session.decks[id] : null;
+}
+
 function attachClient(session, clientId, role, ws) {
   const existing = session.clients.get(clientId);
   if (existing) {
@@ -381,6 +385,7 @@ const HANDLERS = {
   // ---- transport: lead only. A satellite sending these is silently ignored.
   play(ws, msg, session, client) {
     if (client.role !== 'lead') return;
+    if (session.decks.on) return; // queue transport suspended in DECKS mode
     const target = S.gateTrackId(session);
     if (!target) return sendError(ws, 'NO_TRACK', 'QUEUE IS EMPTY');
     if (!allConnectedReadyFor(session, target) && msg.force !== true) {
@@ -394,6 +399,7 @@ const HANDLERS = {
 
   pause(ws, msg, session, client) {
     if (client.role !== 'lead') return;
+    if (session.decks.on) return;
     if (session.playback.status !== 'playing' || session.playback.click) return;
     let pos = S.position(session);
     const track = S.currentTrack(session);
@@ -409,11 +415,13 @@ const HANDLERS = {
 
   stop(ws, msg, session, client) {
     if (client.role !== 'lead') return;
+    if (session.decks.on) return;
     stopPlayback(session);
   },
 
   seek(ws, msg, session, client) {
     if (client.role !== 'lead') return;
+    if (session.decks.on) return;
     if (typeof msg.position !== 'number') return;
     const track = S.currentTrack(session);
     if (!track) return;
@@ -430,6 +438,7 @@ const HANDLERS = {
 
   'skip-next'(ws, msg, session, client) {
     if (client.role !== 'lead') return;
+    if (session.decks.on) return;
     const next = S.resolveNextId(session, { manual: true });
     if (!next) return stopPlayback(session);
     // A manual skip honors the active transition (djay-style: the fade starts
@@ -446,6 +455,7 @@ const HANDLERS = {
   // otherwise it goes to the previous track.
   'skip-prev'(ws, msg, session, client) {
     if (client.role !== 'lead') return;
+    if (session.decks.on) return;
     if (session.playback.status === 'playing' && S.position(session) > 3) {
       return startTrack(session, session.currentTrackId);
     }
@@ -457,6 +467,15 @@ const HANDLERS = {
     if (client.role !== 'lead') return;
     const track = S.getTrack(session, msg.trackId);
     if (!track) return;
+    // A track on a deck dies with its queue row: unload (and silence) it.
+    let decksTouched = false;
+    for (const id of S.DECK_IDS) {
+      if (session.decks[id].trackId === track.id) {
+        Object.assign(session.decks[id], S.newDeck());
+        decksTouched = true;
+      }
+    }
+    if (decksTouched) S.broadcastDecks(session);
     const wasCurrent = track.id === session.currentTrackId;
     const wasPlaying = session.playback.status === 'playing' && !session.playback.click;
     // Resolve the successor BEFORE removal so repeat/shuffle order still sees
@@ -587,10 +606,204 @@ const HANDLERS = {
     S.broadcastQueue(session);
   },
 
+  // ---- DUAL DECK: lead-only. Every deck mutation is answered with ONE
+  // decks-update broadcast (full snapshot, optional `glide` hint for
+  // pitch-only changes); clients reconcile their two channels against it —
+  // the same code path serves live updates, late join and self-heal. --------
+  'decks-mode'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    const on = !!msg.on;
+    const d = session.decks;
+    if (on === d.on) return;
+    if (on) {
+      const p = session.playback;
+      if (p.status === 'playing' && !p.click && !p.rateRamp && session.currentTrackId) {
+        // Seamless adoption: the playing queue track is relabeled as deck A
+        // with the exact same anchors. Clients render the queue on channel A,
+        // so the reconciler recognizes the timeline and nothing restarts.
+        d.A = {
+          trackId: session.currentTrackId,
+          status: 'playing',
+          trackOffset: p.trackOffset,
+          startAtServerTime: p.startAtServerTime,
+          pausedPosition: 0,
+          rate: p.rate,
+          rateRamp: null,
+        };
+        session.playback = {
+          status: 'idle', trackOffset: 0, startAtServerTime: 0, pausedPosition: 0,
+          click: false, rate: 1, rateRamp: null,
+        }; // no 'stop' broadcast: the sound must not gap
+        session.advanceWaitSince = null;
+      } else if (p.status === 'playing') {
+        stopPlayback(session); // click or mid-glide: no clean adoption
+      }
+      d.on = true;
+    } else {
+      d.on = false;
+      d.A = S.newDeck();
+      d.B = S.newDeck();
+      d.xfader = 0;
+    }
+    S.broadcastDecks(session);
+    S.broadcastQueue(session); // prefetch + snapshot changed
+  },
+
+  'deck-load'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    if (!session.decks.on) return;
+    const d = deckOf(session, msg.deck);
+    const track = S.getTrack(session, msg.trackId);
+    if (!d || !track) return;
+    if (d.status === 'playing') return sendError(ws, 'DECK_BUSY', 'DECK IS PLAYING');
+    Object.assign(d, S.newDeck(), { trackId: track.id, status: 'loaded' });
+    S.broadcastDecks(session);
+    S.broadcastQueue(session); // prefetch changed
+  },
+
+  'deck-play'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    if (!session.decks.on) return;
+    const d = deckOf(session, msg.deck);
+    if (!d || !d.trackId || d.status === 'playing') return;
+    const track = S.getTrack(session, d.trackId);
+    if (!track) return;
+    if (!allConnectedReadyFor(session, d.trackId) && msg.force !== true) {
+      return sendError(ws, 'NOT_READY', 'CLIENTS STILL LOADING');
+    }
+    let from = typeof msg.position === 'number' ? Math.max(0, msg.position) : (d.pausedPosition || 0);
+    if (track.duration && from >= track.duration) from = 0;
+    d.status = 'playing';
+    d.trackOffset = from;
+    d.startAtServerTime = now() + S.DECK_PLAY_LEAD_MS;
+    d.pausedPosition = 0;
+    S.broadcastDecks(session);
+  },
+
+  'deck-pause'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    if (!session.decks.on) return;
+    const d = deckOf(session, msg.deck);
+    if (!d || d.status !== 'playing') return;
+    let pos = S.deckPosition(session, msg.deck);
+    const track = S.getTrack(session, d.trackId);
+    if (track && track.duration) pos = Math.min(pos, track.duration);
+    Object.assign(d, { status: 'paused', trackOffset: 0, startAtServerTime: 0, pausedPosition: pos });
+    S.broadcastDecks(session);
+  },
+
+  'deck-seek'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    if (!session.decks.on) return;
+    const d = deckOf(session, msg.deck);
+    if (!d || !d.trackId || typeof msg.position !== 'number' || !isFinite(msg.position)) return;
+    const track = S.getTrack(session, d.trackId);
+    let pos = Math.max(0, msg.position);
+    if (track && track.duration) pos = Math.min(pos, Math.max(0, track.duration - 0.05));
+    if (d.status === 'playing') {
+      d.trackOffset = pos;
+      d.startAtServerTime = now() + S.DECK_PLAY_LEAD_MS;
+    } else {
+      d.pausedPosition = pos;
+      if (d.status === 'ended') d.status = 'paused';
+    }
+    S.broadcastDecks(session);
+  },
+
+  // Per-deck pitch: re-anchor at a shared instant, clients glide playbackRate
+  // locally (no restart) — the `glide` hint tells the reconciler to do that
+  // instead of rescheduling the source.
+  'deck-rate'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    if (!session.decks.on) return;
+    const d = deckOf(session, msg.deck);
+    if (!d || typeof msg.rate !== 'number' || !isFinite(msg.rate)) return;
+    const rate = Math.min(S.TEMPO_MAX, Math.max(S.TEMPO_MIN, msg.rate));
+    if (rate === d.rate) return;
+    let glide = null;
+    if (d.status === 'playing') {
+      const applyAt = now() + S.FX_APPLY_LEAD_MS;
+      d.trackOffset = S.deckPosition(session, msg.deck, applyAt);
+      d.startAtServerTime = applyAt;
+      d.rate = rate;
+      glide = { deck: msg.deck, rate, trackOffset: d.trackOffset, applyAtServerTime: applyAt };
+    } else {
+      d.rate = rate;
+    }
+    S.broadcast(session, { type: 'decks-update', decks: S.decksSnapshot(session), glide });
+  },
+
+  // SYNC: match this deck's effective BPM to the other deck's, then align the
+  // beat phase with a nearest-beat micro-seek (≤ half a beat, rendered as a
+  // short crossfaded reschedule) so the grids coincide on the other deck's
+  // next beat.
+  'deck-sync'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    if (!session.decks.on) return;
+    const id = msg.deck;
+    const other = id === 'A' ? 'B' : 'A';
+    const d = deckOf(session, id);
+    const o = deckOf(session, other);
+    if (!d || !o || !d.trackId || !o.trackId) return sendError(ws, 'SYNC_UNAVAILABLE', 'LOAD BOTH DECKS');
+    const tD = S.getTrack(session, d.trackId);
+    const tO = S.getTrack(session, o.trackId);
+    const mD = tD && tD.meta;
+    const mO = tO && tO.meta;
+    if (!mD || !mO || !mD.bpm || !mO.bpm || mD.confidence < 0.2 || mO.confidence < 0.2) {
+      return sendError(ws, 'SYNC_UNAVAILABLE', 'NO RELIABLE BPM');
+    }
+    let ratio = (mO.bpm * o.rate) / mD.bpm; // rate that makes effective BPMs equal
+    while (ratio > 1.5) ratio /= 2;
+    while (ratio < 1 / 1.5) ratio *= 2;
+    if (ratio < S.TEMPO_MIN || ratio > S.TEMPO_MAX) {
+      return sendError(ws, 'SYNC_UNAVAILABLE', 'BPM OUT OF PITCH RANGE');
+    }
+    if (d.status !== 'playing' || o.status !== 'playing') {
+      // Nothing to phase-align against: just take the rate.
+      d.rate = ratio;
+      S.broadcastDecks(session);
+      return;
+    }
+    const applyAt = now() + S.FX_APPLY_LEAD_MS;
+    const posO = S.timelinePositionAt(o, applyAt);
+    const bO = 60 / mO.bpm;
+    const kO = Math.ceil((posO - (mO.beatPhase || 0)) / bO - 1e-6);
+    const tBeat = applyAt + (((mO.beatPhase || 0) + kO * bO - posO) / o.rate) * 1000;
+    const posD = S.timelinePositionAt(d, applyAt);
+    const posDAtBeat = posD + ((tBeat - applyAt) / 1000) * ratio;
+    const bD = 60 / mD.bpm;
+    const m = Math.round((posDAtBeat - (mD.beatPhase || 0)) / bD);
+    const delta = ((mD.beatPhase || 0) + m * bD) - posDAtBeat;
+    let from = posD + delta;
+    if (from < 0) from += bD;
+    if (tD.duration && from > tD.duration - 0.1) return sendError(ws, 'SYNC_UNAVAILABLE', 'TRACK ENDING');
+    d.trackOffset = from;
+    d.startAtServerTime = applyAt;
+    d.rate = ratio;
+    S.broadcastDecks(session); // no glide: the micro-seek is a reschedule
+  },
+
+  // Crossfader stream (throttled client-side like fx-set): −1 = only A,
+  // +1 = only B, equal-power law rendered by every client.
+  xfader(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    if (!session.decks.on) return;
+    if (typeof msg.x !== 'number' || !isFinite(msg.x)) return;
+    session.decks.xfader = Math.min(1, Math.max(-1, msg.x));
+    S.broadcast(session, {
+      type: 'xfader-update',
+      x: session.decks.xfader,
+      applyAtServerTime: now() + S.FX_APPLY_LEAD_MS,
+    });
+  },
+
   // Calibration click track — generated locally by every client, scheduled
   // like a normal track; the queue is untouched.
   'click-start'(ws, msg, session, client) {
     if (client.role !== 'lead') return;
+    // The click rides the queue timeline; with two deck timelines live it
+    // would be ambiguous — calibration happens in queue mode.
+    if (session.decks.on) return sendError(ws, 'CLICK_UNAVAILABLE', 'EXIT DECKS TO CALIBRATE');
     startTrack(session, null, { click: true });
   },
 
@@ -610,6 +823,7 @@ const HANDLERS = {
       status: session.playback.status,
       rate: S.currentRate(session),
       rampActive: !!session.playback.rateRamp,
+      decks: session.decks.on ? heartbeatDecks(session) : undefined,
     });
   },
 
@@ -629,6 +843,7 @@ const SESSION_SCOPED = new Set([
   'client-ready', 'play', 'pause', 'stop', 'seek',
   'skip-next', 'skip-prev', 'queue-remove', 'queue-reorder', 'set-repeat', 'set-shuffle',
   'track-meta', 'set-transition', 'set-tempo', 'fx-set', 'cue-set',
+  'decks-mode', 'deck-load', 'deck-play', 'deck-pause', 'deck-seek', 'deck-rate', 'deck-sync', 'xfader',
   'click-start', 'click-stop', 'position-request', 'leave',
 ]);
 
@@ -676,6 +891,24 @@ wss.on('connection', (ws) => {
 // after ADVANCE_WAIT_MS with whoever is ready.
 setInterval(() => {
   for (const session of S.sessions.values()) {
+    if (session.decks.on) {
+      // DECKS mode: auto-advance suspended; just mark decks that ran out.
+      let changed = false;
+      for (const id of S.DECK_IDS) {
+        const d = session.decks[id];
+        if (d.status !== 'playing') continue;
+        const track = S.getTrack(session, d.trackId);
+        if (!track || !track.duration) continue;
+        if (S.deckPosition(session, id) >= track.duration + 0.05) {
+          Object.assign(d, {
+            status: 'ended', trackOffset: 0, startAtServerTime: 0, pausedPosition: track.duration,
+          });
+          changed = true;
+        }
+      }
+      if (changed) S.broadcastDecks(session);
+      continue;
+    }
     S.commitRateRamp(session); // fold finished beatmatch glides back to constant rate
     const p = session.playback;
     if (p.status !== 'playing' || p.click) continue;
@@ -711,16 +944,28 @@ setInterval(() => {
 
 // ------------------------------------------------------------ heartbeats ----
 // Every 5 s: authoritative position broadcast → clients measure their drift.
+// In DECKS mode the heartbeat carries BOTH deck timelines (per-channel drift).
+function heartbeatDecks(session) {
+  const one = (id) => {
+    const d = session.decks[id];
+    return { status: d.status, position: S.deckPosition(session, id), rate: d.rate };
+  };
+  return { on: true, A: one('A'), B: one('B') };
+}
+
 setInterval(() => {
   for (const session of S.sessions.values()) {
-    if (session.playback.status !== 'playing') continue;
+    const decksLive = session.decks.on
+      && (session.decks.A.status === 'playing' || session.decks.B.status === 'playing');
+    if (session.playback.status !== 'playing' && !decksLive) continue;
     S.broadcast(session, {
       type: 'position-heartbeat',
       serverTime: now(),
       trackPosition: S.position(session),
-      status: 'playing',
+      status: session.playback.status,
       rate: S.currentRate(session),
       rampActive: !!session.playback.rateRamp,
+      decks: session.decks.on ? heartbeatDecks(session) : undefined,
     });
   }
 }, 5000);

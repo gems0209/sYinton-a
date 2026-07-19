@@ -42,6 +42,7 @@ const S = {
   transitionMode: 'cut', // MIX: how the queue moves from track to track
   tempo: 1,              // MIX: master tempo (0.92..1.08)
   fx: null,              // MIX: live EQ/filter state (server-owned)
+  decks: null,           // DUAL DECK snapshot {on, xfader, A, B} (server-owned)
   playback: { status: 'idle' },
   peers: [],
   wakeLock: null,
@@ -88,6 +89,7 @@ function showView(name) {
   if (name === 'home') {
     S.role = null;
     S.code = null;
+    S.decks = null;
     bufferCache.clear();
     safeRemove(sessionStorage, 'wavepool-session');
     if (location.pathname !== '/debug') history.replaceState(null, '', '/');
@@ -152,6 +154,7 @@ function armThen(fn) {
 // if a gesture is needed) and re-schedules from the authoritative timeline.
 function ensurePlaying() {
   if (!S.code || S.playback.status !== 'playing' || S.playback.click) return;
+  if (S.decks && S.decks.on) return; // queue rendering is suspended in DECKS mode
   if (player.playing) return;
   const buf = bufferCache.get(S.currentTrackId);
   if (!buf) return; // still downloading/decoding — retried after decode
@@ -344,6 +347,88 @@ ws.on('fx-update', (msg) => {
   if (dj) dj.onFx();
 });
 
+// ------------------------------------------------------------- DUAL DECK --
+// One reconciler for everything deck-related: every decks-update (and the
+// decks snapshot inside queue-update/joined) describes the authoritative
+// state of both timelines; each channel is nudged to match. The same code
+// path therefore serves live updates, late join and self-heal. A `glide`
+// hint marks pitch-only changes so the source glides instead of restarting.
+const deckTrack = { A: null, B: null }; // trackId currently on each channel
+
+function reconcileDeck(id, d, glide) {
+  if (d.status === 'playing') {
+    if (glide && player.deckPlaying(id)) {
+      player.deckSetRate(id, glide.rate, glide.trackOffset, glide.applyAtServerTime);
+      return;
+    }
+    const cur = player.deckLastMsg(id);
+    const matches = player.deckPlaying(id) && cur
+      && Math.abs(cur.startAtServerTime - d.startAtServerTime) < 1
+      && Math.abs(cur.trackOffset - d.trackOffset) < 1e-6
+      && cur.rate === d.rate;
+    if (matches) { deckTrack[id] = d.trackId; return; } // includes seamless adoption
+    const buf = d.trackId ? bufferCache.get(d.trackId) : null;
+    if (!buf) return; // still decoding — healDecks() re-runs after the decode
+    armThen(() => {
+      const dd = S.decks && S.decks[id];
+      if (!S.decks || !S.decks.on || !dd || dd.status !== 'playing') return;
+      const b = bufferCache.get(dd.trackId);
+      if (!b) return;
+      player.deckSetBuffer(id, b);
+      deckTrack[id] = dd.trackId;
+      player.deckScheduleAt(id, dd.startAtServerTime, dd.trackOffset, {
+        rate: dd.rate,
+        fadeIn: player.deckPlaying(id) ? 0.06 : 0, // micro-seek/sync lands as a short crossfade
+      });
+    });
+  } else if (d.status === 'paused' || d.status === 'ended') {
+    if (player.deckPlaying(id)) player.deckPause(id, d.pausedPosition);
+    deckTrack[id] = d.trackId;
+  } else { // empty | loaded
+    if (player.deckPlaying(id)) player.deckStop(id);
+    deckTrack[id] = d.trackId;
+  }
+}
+
+function applyDecks(snapshot, glide = null) {
+  if (!snapshot) return;
+  const prevOn = !!(S.decks && S.decks.on);
+  S.decks = snapshot;
+  if (snapshot.on !== prevOn) player.setDecksActive(snapshot.on);
+  if (snapshot.on) {
+    if (snapshot.on !== prevOn) player.setXfader(snapshot.xfader);
+    for (const id of ['A', 'B']) reconcileDeck(id, snapshot[id], glide && glide.deck === id ? glide : null);
+    if (S.playback.status === 'playing' && !S.playback.click) {
+      // The queue timeline was adopted (or stopped) server-side.
+      S.playback = { status: 'idle' };
+    }
+  } else {
+    deckTrack.A = null;
+    deckTrack.B = null;
+  }
+  renderStatus();
+  renderTrack();
+  renderQueue();
+  if (dj) dj.onDecks();
+}
+
+function healDecks() {
+  if (!S.decks || !S.decks.on) return;
+  for (const id of ['A', 'B']) reconcileDeck(id, S.decks[id], null);
+}
+
+ws.on('decks-update', (msg) => applyDecks(msg.decks, msg.glide || null));
+
+ws.on('xfader-update', (msg) => {
+  if (typeof msg.x !== 'number') return;
+  if (S.decks) S.decks.xfader = msg.x;
+  const applyCtx = player.ctx
+    ? player.ctxTimeFor(clock.serverToLocal(msg.applyAtServerTime || 0))
+    : 0;
+  player.setXfader(msg.x, applyCtx);
+  if (dj) dj.onXfader();
+});
+
 ws.on('pause', (msg) => {
   S.playback = { status: 'paused', position: msg.position };
   player.pauseAt(msg.position);
@@ -358,6 +443,22 @@ ws.on('stop', () => {
 });
 
 ws.on('position-heartbeat', (msg) => {
+  if (msg.decks && msg.decks.on) {
+    // DECKS mode: per-channel drift against both authoritative timelines.
+    for (const id of ['A', 'B']) {
+      const d = msg.decks[id];
+      if (d && d.status === 'playing') {
+        player.deckCheckDrift(id, msg.serverTime, d.position, d.rate);
+      }
+      if (S.decks && S.decks[id]) {
+        S.decks[id].status = d.status;
+        S.decks[id].rate = d.rate;
+      }
+    }
+    healDecks();
+    renderTech();
+    return;
+  }
   if (msg.status && msg.status !== 'playing') return;
   player.checkDrift(msg.serverTime, msg.trackPosition, msg.rate ?? 1, !!msg.rampActive);
   ensurePlaying();
@@ -404,6 +505,7 @@ function applyQueueUpdate(msg) {
   renderTrack();
   renderStatus();
   ensureBuffers();
+  if (msg.decks) applyDecks(msg.decks); // snapshot rides in every queue-update
   if (dj) dj.onQueue();
 }
 
@@ -427,6 +529,7 @@ async function ensureBuffers() {
       renderQueue();
       renderTrack();
       ensurePlaying(); // late join / track-change that was waiting on this decode
+      healDecks();     // same, for deck timelines
     } catch (err) {
       decoding.delete(id);
       flash(`ERR: ${String(err.message).toUpperCase()}`);
@@ -555,6 +658,7 @@ const progress = $('progress');
 progress.addEventListener('click', (e) => {
   const track = currentTrack();
   if (S.role !== 'lead' || !track || !track.duration) return;
+  if (S.decks && S.decks.on) return; // seek the decks from their own strips
   const r = progress.getBoundingClientRect();
   const frac = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
   ws.send({ type: 'seek', sessionCode: S.code, position: frac * track.duration });
@@ -562,6 +666,7 @@ progress.addEventListener('click', (e) => {
 
 // ------------------------------------------------------------- rendering ---
 function statusKey() {
+  if (S.decks && S.decks.on) return 'st_decks';
   if (S.playback.click) return 'st_click';
   if (S.playback.status === 'playing') {
     // Playing per the server but this device hasn't decoded the track yet.
@@ -578,7 +683,9 @@ function renderStatus() {
   const st = t(statusKey());
   $('lead-status').textContent = st;
   $('sat-status').textContent = st;
-  const playing = S.playback.status === 'playing';
+  const decksLive = !!(S.decks && S.decks.on
+    && (S.decks.A.status === 'playing' || S.decks.B.status === 'playing'));
+  const playing = S.playback.status === 'playing' || decksLive;
   $('sat-waiting').hidden = !(S.role === 'satellite' && !playing && S.queue.length === 0);
   const an = playing ? player.analyser : null;
   waves.sat.setAnalyser(an);
@@ -587,6 +694,18 @@ function renderStatus() {
 }
 
 function renderTrack() {
+  if (S.decks && S.decks.on) {
+    // DECKS mode: show what sits on each deck instead of the queue track.
+    const nameOf = (id) => {
+      const tr = S.queue.find((q) => q.id === S.decks[id].trackId);
+      return tr ? tr.name.toUpperCase() : '—';
+    };
+    const line = `A: ${nameOf('A')} · B: ${nameOf('B')}`;
+    $('lead-track').textContent = line;
+    $('sat-track').textContent = line;
+    $('time-dur').textContent = fmtTime(0);
+    return;
+  }
   const track = currentTrack();
   $('lead-track').textContent = track ? track.name.toUpperCase() : t('no_track');
   $('sat-track').textContent = track ? track.name.toUpperCase() : '';
@@ -653,9 +772,27 @@ function renderQueue() {
           b.addEventListener('click', fn);
           controls.appendChild(b);
         };
-        mk('↑', 'up', () => ws.send({ type: 'queue-reorder', sessionCode: S.code, from: i, to: i - 1 }), i === 0);
-        mk('↓', 'down', () => ws.send({ type: 'queue-reorder', sessionCode: S.code, from: i, to: i + 1 }), i === S.queue.length - 1);
-        mk('✕', 'remove', () => ws.send({ type: 'queue-remove', sessionCode: S.code, trackId: track.id }));
+        if (S.decks && S.decks.on) {
+          // DECKS mode: each row can be thrown onto a deck (server refuses if
+          // that deck is playing). Reorder is meaningless here, remove stays.
+          const onDeck = (id) => S.decks[id].trackId === track.id;
+          const mkDeck = (id) => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.textContent = id;
+            b.setAttribute('aria-label', `load deck ${id}`);
+            if (onDeck(id)) b.classList.add('on');
+            b.addEventListener('click', () => ws.send({ type: 'deck-load', sessionCode: S.code, deck: id, trackId: track.id }));
+            controls.appendChild(b);
+          };
+          mkDeck('A');
+          mkDeck('B');
+          mk('✕', 'remove', () => ws.send({ type: 'queue-remove', sessionCode: S.code, trackId: track.id }));
+        } else {
+          mk('↑', 'up', () => ws.send({ type: 'queue-reorder', sessionCode: S.code, from: i, to: i - 1 }), i === 0);
+          mk('↓', 'down', () => ws.send({ type: 'queue-reorder', sessionCode: S.code, from: i, to: i + 1 }), i === S.queue.length - 1);
+          mk('✕', 'remove', () => ws.send({ type: 'queue-remove', sessionCode: S.code, trackId: track.id }));
+        }
         li.appendChild(controls);
       }
       ul.appendChild(li);
@@ -675,11 +812,15 @@ function updateTransport() {
   if (S.role !== 'lead') return;
   const hasQueue = S.queue.length > 0;
   const ready = hasQueue && allReady();
-  $('btn-play').disabled = !ready || S.playback.status === 'playing';
-  $('btn-pause').disabled = S.playback.status !== 'playing' || !!S.playback.click;
-  $('btn-stop').disabled = S.playback.status === 'idle';
-  $('btn-prev').disabled = !hasQueue || !!S.playback.click;
-  $('btn-next').disabled = !hasQueue || !!S.playback.click;
+  const decksOn = !!(S.decks && S.decks.on);
+  // DECKS mode: the queue transport is the server's to refuse anyway — grey
+  // it out so the UI tells the truth.
+  $('btn-play').disabled = decksOn || !ready || S.playback.status === 'playing';
+  $('btn-pause').disabled = decksOn || S.playback.status !== 'playing' || !!S.playback.click;
+  $('btn-stop').disabled = decksOn || S.playback.status === 'idle';
+  $('btn-prev').disabled = decksOn || !hasQueue || !!S.playback.click;
+  $('btn-next').disabled = decksOn || !hasQueue || !!S.playback.click;
+  $('btn-click').disabled = decksOn;
   $('btn-repeat').textContent = `${t('repeat')}: ${t('rep_' + S.repeatMode)}`;
   $('btn-repeat').classList.toggle('on', S.repeatMode !== 'off');
   $('btn-shuffle').textContent = `${t('shuffle')}: ${S.shuffle ? t('on') : t('off')}`;
@@ -702,13 +843,16 @@ function updateTransport() {
 let stallClock = -1;
 let stallTicks = 0;
 setInterval(() => {
-  if (player.playing && player.ctx) {
+  if (player.anyPlaying && player.ctx) {
     if (player.ctx.currentTime === stallClock) {
       stallTicks++;
       if (stallTicks >= 10) { // frozen for ~2.5 s
         stallTicks = 0;
-        player.playing = false; // drop the dead source; ensurePlaying re-arms
+        // Drop the dead sources; the heal paths re-arm and re-schedule.
+        player.ch[0].playing = false;
+        player.ch[1].playing = false;
         ensurePlaying();
+        healDecks();
       }
     } else {
       stallClock = player.ctx.currentTime;
@@ -716,7 +860,7 @@ setInterval(() => {
     }
   }
   const track = currentTrack();
-  if (S.role === 'lead' && track?.duration) {
+  if (S.role === 'lead' && track?.duration && !(S.decks && S.decks.on)) {
     const pos = S.playback.status === 'playing' ? player.idealPosition()
       : (S.playback.status === 'paused' ? (S.playback.position || 0) : player.lastPos);
     const frac = Math.min(1, Math.max(0, pos / track.duration));
@@ -789,6 +933,7 @@ document.addEventListener('visibilitychange', async () => {
     if (S.code) ws.send({ type: 'position-request', sessionCode: S.code });
   }
   ensurePlaying();
+  healDecks();
 });
 
 // Shared URL: show the code in the boxes while the auto-join runs.

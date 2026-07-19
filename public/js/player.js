@@ -14,18 +14,19 @@
 //   - user calibration c (ms): positive = play later on this device.
 //   shiftSec = c/1000 - outputLatency;  when += shiftSec
 // Because of the shift, the MEASURED position of this client differs from the
-// ideal server position by -shiftSec·rate (a time shift of dt at playback
-// rate r displaces the track position by r·dt). Drift checks must compare
-// like with like: drift = measuredPos - (idealServerPos - shiftSec·rate).
+// ideal server position by -shiftSec·rate. Drift checks compare like with
+// like: drift = measuredPos - (idealServerPos - shiftSec·rate).
 //
-// PLAYBACK RATE (MIX MODE)
-// ------------------------
-// The server owns a per-track constant rate (master tempo × beatmatch ratio)
-// plus, right after a beatmatch overlap, a single linear ramp gliding the rate
-// back to the master tempo. Position is the integral of the rate — piecewise
-// linear/quadratic, computed exactly on both sides. Drift correction is
-// suspended while a ramp is in flight (the server heartbeat flags it) and
-// picks the timeline back up once the rate is constant again.
+// CHANNELS (DUAL DECK)
+// --------------------
+// The engine is two independent Channels — each with its own source, fade
+// gain, EQ-swap shelf, anchors, rate (+ optional ramp) and drift machinery —
+// mixed by a crossfader (two gain nodes) into the shared MIX fx chain.
+// Channel 0 doubles as the QUEUE path (playlist, transitions, click track):
+// the legacy single-track API delegates to it untouched. In DECKS mode the
+// same two channels become deck A and deck B under the crossfader; a playing
+// queue track can be adopted as deck A with zero glitch because it already
+// lives on channel 0.
 
 // iPadOS 13+ pretends to be MacIntel; the touch check catches it.
 const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
@@ -41,174 +42,36 @@ function epCurve(up, n = 33) {
   return c;
 }
 
-export class SyncPlayer {
-  constructor(clock) {
-    this.clock = clock;
-    this.ctx = null;
-    this.master = null;      // volume
-    this.analyser = null;    // feeds the WaveField when playing
-    this.buffer = null;      // decoded track
-    this._click = null;      // generated click-track buffer (lazy)
+// One independent playback timeline: source + fade gain + shelf feeding a
+// channel output gain (the crossfader leg). All scheduling/drift math lives
+// here; the player owns the clock mapping and the shared fx chain.
+class Channel {
+  constructor(player) {
+    this.p = player;
+    this.out = null;         // crossfader leg (GainNode), created in init
+    this.buffer = null;
     this.source = null;
-    this.srcGain = null;     // per-source gain, used for fades/crossfades
-    this.srcShelf = null;    // per-source low shelf, used by the beatmatch EQ swap
-    this.tail = null;        // outgoing source during a transition {src, gain, shelf}
+    this.srcGain = null;
+    this.srcShelf = null;
+    this.tail = null;        // outgoing source during a queue transition
     this.playing = false;
     this.clickMode = false;
-    this.calibrationMs = 0;
-    this.shiftSec = 0;
-    this.anchorCtx = 0;      // ctx time ↔ track position anchor of current source
+    this.anchorCtx = 0;
     this.anchorPos = 0;
-    this.rate = 1;           // constant playback rate of the current source
-    this.rateRamp = null;    // {startCtx, dur, from, to} — linear glide (beatmatch exit)
+    this.rate = 1;
+    this.rateRamp = null;    // {startCtx, dur, from, to}
     this.lastPos = 0;
     this.lastDrift = 0;
-    this.lastPlayMsg = null; // {startAtServerTime, trackOffset, click, rate, ramp} for re-scheduling
-    this.lastHeartbeat = null;
-    this.fxState = null;     // last applied MIX fx (EQ/filter)
-    this._map = { perf: 0, ctx: 0 };
+    this.lastPlayMsg = null; // {startAtServerTime, trackOffset, click, rate, ramp}
   }
 
-  init() {
-    if (this.ctx) return;
-    const AC = window.AudioContext || window.webkitAudioContext;
-    this.ctx = new AC();
-    this.master = this.ctx.createGain();
-    this.analyser = this.ctx.createAnalyser();
-    this.analyser.fftSize = 1024;
-    this.analyser.smoothingTimeConstant = 0.85;
+  get ctx() { return this.p.ctx; }
 
-    // MIX fx chain, identical on every device (the lead drives it, satellites
-    // render it): sources → [srcGain → srcShelf] → fxInput → 3-band EQ →
-    // bipolar filter (HP+LP) → master (volume) → analyser → destination.
-    // At rest every stage is flat/parked, so the chain is sonically neutral.
-    this.fxInput = this.ctx.createGain();
-    this.eqLow = this.ctx.createBiquadFilter();
-    this.eqLow.type = 'lowshelf';
-    this.eqLow.frequency.value = 200;
-    this.eqMid = this.ctx.createBiquadFilter();
-    this.eqMid.type = 'peaking';
-    this.eqMid.frequency.value = 1000;
-    this.eqMid.Q.value = 0.9;
-    this.eqHigh = this.ctx.createBiquadFilter();
-    this.eqHigh.type = 'highshelf';
-    this.eqHigh.frequency.value = 4000;
-    this.hp = this.ctx.createBiquadFilter();
-    this.hp.type = 'highpass';
-    this.hp.frequency.value = 20;
-    this.lp = this.ctx.createBiquadFilter();
-    this.lp.type = 'lowpass';
-    this.lp.frequency.value = 20000;
-    this.fxInput.connect(this.eqLow);
-    this.eqLow.connect(this.eqMid);
-    this.eqMid.connect(this.eqHigh);
-    this.eqHigh.connect(this.hp);
-    this.hp.connect(this.lp);
-    this.lp.connect(this.master);
+  setBuffer(buffer) { this.buffer = buffer; }
 
-    this.master.connect(this.analyser);
-    if (IS_IOS) {
-      // iOS mutes raw Web Audio output with the hardware silent switch, but
-      // treats <audio>-element playback as "media" (like YouTube) and lets it
-      // through. Route the mix into an element via MediaStream. This path has
-      // a device-fixed extra latency — that's what the calibration slider and
-      // the click track are for.
-      this.mediaDest = this.ctx.createMediaStreamDestination();
-      this.analyser.connect(this.mediaDest);
-      this.audioEl = document.createElement('audio');
-      this.audioEl.setAttribute('playsinline', '');
-      this.audioEl.srcObject = this.mediaDest.stream;
-    } else {
-      this.analyser.connect(this.ctx.destination);
-    }
-    if (this.fxState) this.setFx(this.fxState, 0); // fx arrived before audio was armed
-    this._sampleMap();
-    // Re-sample often: the two clocks tick at (slightly) different rates and
-    // ctx.currentTime freezes while suspended.
-    setInterval(() => this._sampleMap(), 2000);
-  }
-
-  // Arm on a user gesture: resume + play a silent buffer (required to really
-  // unlock audio on iOS Safari).
-  async arm() {
-    this.init();
-    try { await this.ctx.resume(); } catch { /* retried by overlay */ }
-    try {
-      const b = this.ctx.createBuffer(1, 32, this.ctx.sampleRate);
-      const s = this.ctx.createBufferSource();
-      s.buffer = b;
-      s.connect(this.ctx.destination);
-      s.start(0);
-    } catch { /* ignore */ }
-    if (this.audioEl) {
-      // Must start inside a user gesture at least once (iOS media policy).
-      try { await this.audioEl.play(); } catch { /* overlay will retry */ }
-    }
-    // Safari exposes a non-standard 'interrupted' state — treat it as not armed.
-    return this.ctx.state === 'running';
-  }
-
-  _sampleMap() {
-    if (!this.ctx || this.ctx.state !== 'running') return;
-    this._map = { perf: performance.now(), ctx: this.ctx.currentTime };
-  }
-
-  ctxTimeFor(perfTime) {
-    return this._map.ctx + (perfTime - this._map.perf) / 1000;
-  }
-
-  outputLatency() {
-    if (!this.ctx) return 0;
-    // Safari/iOS often expose neither (or 0): fall back to 0 and rely on the
-    // manual calibration slider.
-    const out = (typeof this.ctx.outputLatency === 'number' && this.ctx.outputLatency > 0)
-      ? this.ctx.outputLatency : 0;
-    return out + (this.ctx.baseLatency || 0);
-  }
-
-  get duration() {
-    return this.buffer ? this.buffer.duration : 0;
-  }
-
-  // The queue prefetch (main.js) owns the decoded buffers; the player only
-  // holds the one being scheduled.
-  setBuffer(buffer) {
-    this.buffer = buffer;
-  }
-
-  // Decode without touching current playback (prefetch of the next track).
-  async decode(url) {
-    this.init();
-    const res = await fetch(url);
-    if (!res.ok) throw new Error('download failed');
-    const data = await res.arrayBuffer();
-    return new Promise((resolve, reject) => {
-      const p = this.ctx.decodeAudioData(data, resolve, reject);
-      if (p && p.then) p.then(resolve, reject);
-    });
-  }
-
-  // 1 s looped buffer with a short 1.5 kHz burst at t=0 — one beat per second.
-  // Generated locally on every device (identical by construction), scheduled
-  // exactly like a normal track.
-  clickBuffer() {
-    if (this._click) return this._click;
-    const sr = this.ctx.sampleRate;
-    const buf = this.ctx.createBuffer(1, sr, sr);
-    const ch = buf.getChannelData(0);
-    for (let i = 0; i < sr * 0.03; i++) {
-      const t = i / sr;
-      ch[i] = Math.sin(2 * Math.PI * 1500 * t) * Math.exp(-t / 0.005) * 0.8;
-    }
-    this._click = buf;
-    return buf;
-  }
-
-  // Convert a server-time rate ramp into ctx time, folding it away if it is
-  // already over (late join) or splitting it if we land mid-glide.
   _resolveRamp(rate, ramp) {
     if (!ramp) return { rate, rampCtx: null };
-    const startCtx = this.ctxTimeFor(this.clock.serverToLocal(ramp.startAt)) + this.shiftSec;
+    const startCtx = this.p.ctxTimeFor(this.p.clock.serverToLocal(ramp.startAt)) + this.p.shiftSec;
     const dur = ramp.dur / 1000;
     const nowCtx = this.ctx.currentTime;
     if (nowCtx >= startCtx + dur) return { rate: ramp.to, rampCtx: null };
@@ -220,7 +83,6 @@ export class SyncPlayer {
     return { rate, rampCtx: { startCtx, dur, from: rate, to: ramp.to } };
   }
 
-  // Track seconds elapsed between two ctx instants under rate+ramp (piecewise).
   _advance(rate, rampCtx, a, b) {
     if (!rampCtx) return (b - a) * rate;
     let adv = (Math.min(b, rampCtx.startCtx) - a) * rate;
@@ -233,21 +95,13 @@ export class SyncPlayer {
   }
 
   // Schedule playback so the first sample leaves the speaker at the instant
-  // the server fixed. Handles late join transparently: if the ideal start is
-  // already in the past, start "now + ε" from the correspondingly advanced
-  // track offset. Options (MIX MODE):
-  //   rate        constant playback rate of the new source (default 1)
-  //   ramp        {to, startAt, dur} server-time rate glide (beatmatch exit)
-  //   transition  {type:'fade'|'beatmatch', dur} — overlap the OUTGOING source
-  //               for dur seconds with an equal-power crossfade instead of
-  //               cutting it; beatmatch adds a low-shelf EQ swap.
+  // the server fixed. Late join: if the start is already past, jump forward.
+  // opts: rate, ramp {to,startAt,dur} (server time), transition {type,dur}.
   scheduleAt(startAtServerTime, trackOffset, click = false, fadeIn = 0, opts = {}) {
     if (!this.ctx || this.ctx.state !== 'running') return false;
-    const buf = click ? this.clickBuffer() : this.buffer;
+    const buf = click ? this.p.clickBuffer() : this.buffer;
     if (!buf) return false;
     const transition = (!click && opts.transition) || null;
-    // Detach the old source but DON'T silence it yet: it keeps playing until
-    // the handover (gapless cut) or through the crossfade (transition).
     const old = this.source;
     const oldGain = this.srcGain;
     const oldShelf = this.srcShelf;
@@ -259,23 +113,20 @@ export class SyncPlayer {
       startAtServerTime, trackOffset, click,
       rate: opts.rate ?? 1, ramp: opts.ramp || null,
     };
-    this._sampleMap();
+    this.p._sampleMap();
 
-    this.shiftSec = this.calibrationMs / 1000 - this.outputLatency();
-    let when = this.ctxTimeFor(this.clock.serverToLocal(startAtServerTime)) + this.shiftSec;
+    this.p.shiftSec = this.p.calibrationMs / 1000 - this.p.outputLatency();
+    let when = this.p.ctxTimeFor(this.p.clock.serverToLocal(startAtServerTime)) + this.p.shiftSec;
     let offset = trackOffset;
     const { rate, rampCtx } = click
       ? { rate: 1, rampCtx: null }
       : this._resolveRamp(opts.rate ?? 1, opts.ramp || null);
     const minStart = this.ctx.currentTime + 0.1;
     if (when < minStart) {
-      // Late join / message arrived after the start instant: jump forward.
       offset += this._advance(rate, rampCtx, when, minStart);
       when = minStart;
     }
 
-    // Whatever was already tailing (previous transition) is silenced at the
-    // new handover: only ever two audible sources at once.
     this._killTail(when);
 
     if (old && oldGain) {
@@ -283,14 +134,12 @@ export class SyncPlayer {
         oldGain.gain.cancelScheduledValues(this.ctx.currentTime);
         if (transition && this.playing) {
           // Crossfade: the outgoing source stays alive under an equal-power
-          // fade for the overlap (auto-advance places `when` exactly fade
-          // seconds before its natural end — the two line up by construction).
+          // fade for the overlap (queue auto-advance places `when` exactly
+          // fade seconds before its natural end).
           const d = Math.max(0.1, transition.dur);
           oldGain.gain.setValueAtTime(oldGain.gain.value, this.ctx.currentTime);
           oldGain.gain.setValueCurveAtTime(epCurve(false), when, d);
           if (transition.type === 'beatmatch' && oldShelf) {
-            // EQ swap, first act: pull the outgoing lows out over the first
-            // 60% of the overlap to leave room for the incoming kick.
             oldShelf.gain.setValueAtTime(oldShelf.gain.value, this.ctx.currentTime);
             oldShelf.gain.linearRampToValueAtTime(-28, when + d * 0.6);
           }
@@ -331,7 +180,6 @@ export class SyncPlayer {
     src.buffer = buf;
     src.loop = loop;
     src.onended = () => {
-      // Natural end of the buffer (replaced sources are nulled out first).
       if (this.source === src) {
         this.source = null;
         this.srcGain = null;
@@ -364,8 +212,6 @@ export class SyncPlayer {
     shelf.type = 'lowshelf';
     shelf.frequency.value = 250;
     if (eqSwapIn) {
-      // EQ swap, second act: the incoming track enters with its lows tucked
-      // away, and gets them back over the final 60% of the overlap.
       shelf.gain.setValueAtTime(-28, when);
       shelf.gain.setValueAtTime(-28, when + xfade * 0.4);
       shelf.gain.linearRampToValueAtTime(0, when + xfade);
@@ -374,9 +220,9 @@ export class SyncPlayer {
     }
     src.connect(g);
     g.connect(shelf);
-    // The calibration click bypasses the MIX fx chain (a killed-low EQ or a
-    // closed filter must never silence the click you calibrate with).
-    shelf.connect(loop ? this.master : this.fxInput);
+    // The calibration click bypasses crossfader + MIX fx (a killed-low EQ or
+    // a closed filter must never silence the click you calibrate with).
+    shelf.connect(loop ? this.p.master : this.out);
     src.start(when, offset);
     this.source = src;
     this.srcGain = g;
@@ -397,8 +243,8 @@ export class SyncPlayer {
   }
 
   stopLocal(fade = 0.03) {
-    // Fade out over `fade` s before stopping — avoids the click of a hard cut.
-    this._killTail(this.ctx ? this.ctx.currentTime + fade : 0);
+    if (!this.ctx) { this.playing = false; return; }
+    this._killTail(this.ctx.currentTime + fade);
     if (this.source) {
       const src = this.source;
       const g = this.srcGain;
@@ -423,60 +269,11 @@ export class SyncPlayer {
     this.lastPos = position;
   }
 
-  // Local measured track position of the running source (integral of the rate).
   position() {
     if (!this.playing || !this.ctx) return this.lastPos;
-    const t = this.ctx.currentTime;
-    const r = this.rateRamp;
-    let pos = this.anchorPos;
-    if (!r) return pos + (t - this.anchorCtx) * this.rate;
-    pos += (Math.min(t, r.startCtx) - this.anchorCtx) * this.rate;
-    if (t > r.startCtx) {
-      const u = Math.min(t - r.startCtx, r.dur);
-      pos += r.from * u + (r.to - r.from) * u * u / (2 * r.dur);
-      if (t - r.startCtx > r.dur) pos += (t - r.startCtx - r.dur) * r.to;
-    }
-    return pos;
+    return this._positionAtCtx(this.ctx.currentTime);
   }
 
-  // Position corrected back into "server ideal" terms (for UI display).
-  idealPosition() {
-    return this.position() + this.shiftSec * this.rate;
-  }
-
-  setVolume(v) {
-    if (!this.master) return;
-    this.master.gain.setTargetAtTime(v, this.ctx.currentTime, 0.01);
-  }
-
-  // Master tempo change: the server re-anchored its timeline at applyAt
-  // (ideal position trackOffset, new constant rate). Glide playbackRate over
-  // ~150 ms centred on that instant (a hard step is audible as a pitch
-  // click); the ≤ 4 ms position error of the glide is swallowed by the next
-  // drift check.
-  setRate(rate, trackOffset, applyAtServerTime) {
-    // Keep the authoritative anchor for later re-schedules (calibration,
-    // self-heal) even if nothing is playing locally right now.
-    this.lastPlayMsg = { startAtServerTime: applyAtServerTime, trackOffset, click: false, rate, ramp: null };
-    if (!this.playing || !this.source || this.clickMode) return;
-    const applyCtx = Math.max(
-      this.ctx.currentTime + 0.02,
-      this.ctxTimeFor(this.clock.serverToLocal(applyAtServerTime)) + this.shiftSec,
-    );
-    try {
-      const p = this.source.playbackRate;
-      p.cancelScheduledValues(this.ctx.currentTime);
-      p.setValueAtTime(this.rate, Math.max(this.ctx.currentTime, applyCtx - 0.075));
-      p.linearRampToValueAtTime(rate, applyCtx + 0.075);
-    } catch { this.source.playbackRate.value = rate; }
-    // Re-anchor the local position mapping at the switch instant (continuous).
-    this.anchorPos = this._positionAtCtx(applyCtx);
-    this.anchorCtx = applyCtx;
-    this.rate = rate;
-    this.rateRamp = null;
-  }
-
-  // Same math as position(), evaluated at an arbitrary ctx instant.
   _positionAtCtx(t) {
     const r = this.rateRamp;
     let pos = this.anchorPos;
@@ -490,66 +287,44 @@ export class SyncPlayer {
     return pos;
   }
 
-  // Live EQ/filter — applied by every device at the same server-fixed instant.
-  setFx(fx, applyCtx) {
-    this.fxState = fx;
-    if (!this.ctx) return; // stored; init() re-applies once audio exists
-    const at = Math.max(this.ctx.currentTime + 0.01, applyCtx || 0);
-    const T = 0.04;
-    const db = (v, kill) => (kill ? -40 : (v || 0));
-    this.eqLow.gain.setTargetAtTime(db(fx.low, fx.killLow), at, T);
-    this.eqMid.gain.setTargetAtTime(db(fx.mid, fx.killMid), at, T);
-    this.eqHigh.gain.setTargetAtTime(db(fx.high, fx.killHigh), at, T);
-    // Bipolar filter, one knob djay-style: negative sweeps the lowpass down
-    // (20 kHz → 150 Hz), positive sweeps the highpass up (20 Hz → 8 kHz).
-    const v = (fx.filter || 0) / 100;
-    const lpF = v < 0 ? 150 * Math.pow(20000 / 150, 1 + v) : 20000;
-    const hpF = v > 0 ? 20 * Math.pow(8000 / 20, v) : 20;
-    this.lp.frequency.setTargetAtTime(lpF, at, 0.06);
-    this.hp.frequency.setTargetAtTime(hpF, at, 0.06);
+  idealPosition() {
+    return this.position() + this.p.shiftSec * this.rate;
   }
 
-  setCalibration(ms) {
-    this.calibrationMs = ms;
-    // Re-anchor against the authoritative server schedule with a soft restart.
-    if (this.playing && this.lastPlayMsg) {
-      const m = this.lastPlayMsg;
-      this.scheduleAt(m.startAtServerTime, m.trackOffset, m.click, 0.05, {
-        rate: m.rate, ramp: m.ramp,
-      });
-    }
+  // Rate change without restart: the server re-anchored at applyAt; glide
+  // playbackRate over ~150 ms centred there (a step is an audible pitch
+  // click); the ≤4 ms position error is swallowed by the next drift check.
+  setRate(rate, trackOffset, applyAtServerTime) {
+    this.lastPlayMsg = { startAtServerTime: applyAtServerTime, trackOffset, click: false, rate, ramp: null };
+    if (!this.playing || !this.source || this.clickMode) return;
+    const applyCtx = Math.max(
+      this.ctx.currentTime + 0.02,
+      this.p.ctxTimeFor(this.p.clock.serverToLocal(applyAtServerTime)) + this.p.shiftSec,
+    );
+    try {
+      const pr = this.source.playbackRate;
+      pr.cancelScheduledValues(this.ctx.currentTime);
+      pr.setValueAtTime(this.rate, Math.max(this.ctx.currentTime, applyCtx - 0.075));
+      pr.linearRampToValueAtTime(rate, applyCtx + 0.075);
+    } catch { this.source.playbackRate.value = rate; }
+    this.anchorPos = this._positionAtCtx(applyCtx);
+    this.anchorCtx = applyCtx;
+    this.rate = rate;
+    this.rateRamp = null;
   }
 
-  // DRIFT CORRECTION — called on every 5 s server heartbeat.
-  //   expected(ctxNow) = hbPosition + (ctxNow - ctxAtHeartbeat)·rate - shiftSec·rate
-  //   drift = measured - expected     (positive = this device is AHEAD)
-  //   |drift| < 15 ms  → leave it alone (inaudible, correction would cost more)
-  //   15–60 ms         → soft re-seek with 50 ms crossfade
-  //   > 60 ms          → hard re-seek with 30 ms fades
-  // NOTE on playbackRate: micro-nudging the rate for a glide correction makes
-  // the position-vs-time mapping unobservable, so we use crossfaded re-seeks
-  // (at 50 ms fades they are inaudible on music and keep the math exact).
-  // MIX-mode rates are different: they are few, server-fixed, and mirrored in
-  // the anchor bookkeeping — during a beatmatch glide (rampActive) correction
-  // is simply suspended and resumes on the next constant-rate heartbeat.
+  // DRIFT CORRECTION — see the header comment; suspended during rate ramps.
   checkDrift(serverTime, trackPosition, hbRate = 1, rampActive = false) {
-    this.lastHeartbeat = { serverTime, trackPosition };
     if (!this.playing || this.clickMode || !this.ctx) return 0;
     if (rampActive) return 0;
-    this._sampleMap();
+    this.p._sampleMap();
     const ctxNow = this.ctx.currentTime;
-    // Local glide still in flight (clocks can disagree by a beat with the
-    // server's rampActive flag): wait until it has settled.
     if (this.rateRamp && ctxNow < this.rateRamp.startCtx + this.rateRamp.dur + 0.5) return 0;
-    // Track-transition window: the next source is scheduled but hasn't started
-    // yet (and the server's authoritative position describes the not-yet-
-    // started segment). Comparing positions here is meaningless and the
-    // resulting "correction" would start the new track early — skip.
-    if (ctxNow < this.anchorCtx + 0.05) return 0;
-    const ctxAtHb = this.ctxTimeFor(this.clock.serverToLocal(serverTime));
+    if (ctxNow < this.anchorCtx + 0.05) return 0; // scheduled, not started yet
+    const ctxAtHb = this.p.ctxTimeFor(this.p.clock.serverToLocal(serverTime));
     const rate = hbRate || this.rate || 1;
-    const expected = trackPosition + (ctxNow - ctxAtHb) * rate - this.shiftSec * rate;
-    if (expected < 0.1) return 0; // segment not really rolling server-side yet
+    const expected = trackPosition + (ctxNow - ctxAtHb) * rate - this.p.shiftSec * rate;
+    if (expected < 0.1) return 0;
     const drift = this.position() - expected;
     this.lastDrift = drift;
     const abs = Math.abs(drift);
@@ -558,15 +333,11 @@ export class SyncPlayer {
     return drift;
   }
 
-  // Crossfaded re-seek: new source starts at the corrected position while the
-  // old one fades out — no click, no gap. Runs only at constant rate (drift
-  // checks are suspended during ramps), so the offset advances at this.rate.
   _reseek(fade, expectedNow, ctxNow) {
     if (!this.buffer) return;
     const startCtx = ctxNow + fade;
-    const newOffset = expectedNow + fade * this.rate; // corrected position when new source starts
+    const newOffset = expectedNow + fade * this.rate;
     if (newOffset >= this.buffer.duration || newOffset < 0) return;
-
     const old = this.source;
     const oldGain = this.srcGain;
     this.source = null;
@@ -584,5 +355,260 @@ export class SyncPlayer {
     this.anchorCtx = startCtx;
     this.anchorPos = newOffset;
     this.rateRamp = null;
+  }
+}
+
+const DECK_INDEX = { A: 0, B: 1 };
+
+export class SyncPlayer {
+  constructor(clock) {
+    this.clock = clock;
+    this.ctx = null;
+    this.master = null;      // volume
+    this.analyser = null;    // feeds the WaveField when playing
+    this._click = null;      // generated click-track buffer (lazy)
+    this.calibrationMs = 0;
+    this.shiftSec = 0;
+    this.fxState = null;     // last applied MIX fx (EQ/filter)
+    this.lastHeartbeat = null;
+    this._map = { perf: 0, ctx: 0 };
+    this._xfaderX = -1;      // full A while decks are off (channel 0 = queue)
+    // Channel 0 = queue path AND deck A; channel 1 = deck B.
+    this.ch = [new Channel(this), new Channel(this)];
+  }
+
+  init() {
+    if (this.ctx) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    this.ctx = new AC();
+    this.master = this.ctx.createGain();
+    this.analyser = this.ctx.createAnalyser();
+    this.analyser.fftSize = 1024;
+    this.analyser.smoothingTimeConstant = 0.85;
+
+    // MIX fx chain, identical on every device (the lead drives it, satellites
+    // render it): channels → crossfader legs → fxInput → 3-band EQ → bipolar
+    // filter (HP+LP) → master (volume) → analyser → destination. Everything
+    // is sonically neutral at rest.
+    this.fxInput = this.ctx.createGain();
+    this.eqLow = this.ctx.createBiquadFilter();
+    this.eqLow.type = 'lowshelf';
+    this.eqLow.frequency.value = 200;
+    this.eqMid = this.ctx.createBiquadFilter();
+    this.eqMid.type = 'peaking';
+    this.eqMid.frequency.value = 1000;
+    this.eqMid.Q.value = 0.9;
+    this.eqHigh = this.ctx.createBiquadFilter();
+    this.eqHigh.type = 'highshelf';
+    this.eqHigh.frequency.value = 4000;
+    this.hp = this.ctx.createBiquadFilter();
+    this.hp.type = 'highpass';
+    this.hp.frequency.value = 20;
+    this.lp = this.ctx.createBiquadFilter();
+    this.lp.type = 'lowpass';
+    this.lp.frequency.value = 20000;
+    this.fxInput.connect(this.eqLow);
+    this.eqLow.connect(this.eqMid);
+    this.eqMid.connect(this.eqHigh);
+    this.eqHigh.connect(this.hp);
+    this.hp.connect(this.lp);
+    this.lp.connect(this.master);
+
+    // Crossfader legs. Queue mode: channel 0 full, channel 1 silent.
+    for (const c of this.ch) {
+      c.out = this.ctx.createGain();
+      c.out.connect(this.fxInput);
+    }
+    this.ch[0].out.gain.value = 1;
+    this.ch[1].out.gain.value = 0;
+
+    this.master.connect(this.analyser);
+    if (IS_IOS) {
+      // iOS mutes raw Web Audio output with the hardware silent switch, but
+      // treats <audio>-element playback as "media" and lets it through.
+      this.mediaDest = this.ctx.createMediaStreamDestination();
+      this.analyser.connect(this.mediaDest);
+      this.audioEl = document.createElement('audio');
+      this.audioEl.setAttribute('playsinline', '');
+      this.audioEl.srcObject = this.mediaDest.stream;
+    } else {
+      this.analyser.connect(this.ctx.destination);
+    }
+    if (this.fxState) this.setFx(this.fxState, 0);
+    this._sampleMap();
+    setInterval(() => this._sampleMap(), 2000);
+  }
+
+  async arm() {
+    this.init();
+    try { await this.ctx.resume(); } catch { /* retried by overlay */ }
+    try {
+      const b = this.ctx.createBuffer(1, 32, this.ctx.sampleRate);
+      const s = this.ctx.createBufferSource();
+      s.buffer = b;
+      s.connect(this.ctx.destination);
+      s.start(0);
+    } catch { /* ignore */ }
+    if (this.audioEl) {
+      try { await this.audioEl.play(); } catch { /* overlay will retry */ }
+    }
+    return this.ctx.state === 'running';
+  }
+
+  _sampleMap() {
+    if (!this.ctx || this.ctx.state !== 'running') return;
+    this._map = { perf: performance.now(), ctx: this.ctx.currentTime };
+  }
+
+  ctxTimeFor(perfTime) {
+    return this._map.ctx + (perfTime - this._map.perf) / 1000;
+  }
+
+  outputLatency() {
+    if (!this.ctx) return 0;
+    const out = (typeof this.ctx.outputLatency === 'number' && this.ctx.outputLatency > 0)
+      ? this.ctx.outputLatency : 0;
+    return out + (this.ctx.baseLatency || 0);
+  }
+
+  async decode(url) {
+    this.init();
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('download failed');
+    const data = await res.arrayBuffer();
+    return new Promise((resolve, reject) => {
+      const p = this.ctx.decodeAudioData(data, resolve, reject);
+      if (p && p.then) p.then(resolve, reject);
+    });
+  }
+
+  clickBuffer() {
+    if (this._click) return this._click;
+    const sr = this.ctx.sampleRate;
+    const buf = this.ctx.createBuffer(1, sr, sr);
+    const chd = buf.getChannelData(0);
+    for (let i = 0; i < sr * 0.03; i++) {
+      const t = i / sr;
+      chd[i] = Math.sin(2 * Math.PI * 1500 * t) * Math.exp(-t / 0.005) * 0.8;
+    }
+    this._click = buf;
+    return buf;
+  }
+
+  // ---- legacy queue API: delegates to channel 0 ---------------------------
+  get playing() { return this.ch[0].playing; }
+  set playing(v) { this.ch[0].playing = v; }
+  get lastPos() { return this.ch[0].lastPos; }
+  set lastPos(v) { this.ch[0].lastPos = v; }
+  get rate() { return this.ch[0].rate; }
+  get rateRamp() { return this.ch[0].rateRamp; }
+  get tail() { return this.ch[0].tail; }
+  get clickMode() { return this.ch[0].clickMode; }
+  get buffer() { return this.ch[0].buffer; }
+  get duration() { return this.ch[0].buffer ? this.ch[0].buffer.duration : 0; }
+  get lastDrift() {
+    // The techline shows the worse of the two channels.
+    const a = this.ch[0].lastDrift;
+    const b = this.ch[1].playing ? this.ch[1].lastDrift : 0;
+    return Math.abs(b) > Math.abs(a) ? b : a;
+  }
+  get anyPlaying() { return this.ch[0].playing || this.ch[1].playing; }
+
+  setBuffer(buffer) { this.ch[0].setBuffer(buffer); }
+  scheduleAt(startAtServerTime, trackOffset, click = false, fadeIn = 0, opts = {}) {
+    return this.ch[0].scheduleAt(startAtServerTime, trackOffset, click, fadeIn, opts);
+  }
+  pauseAt(position) { this.ch[0].pauseAt(position); }
+  position() { return this.ch[0].position(); }
+  idealPosition() { return this.ch[0].idealPosition(); }
+  setRate(rate, trackOffset, applyAtServerTime) { this.ch[0].setRate(rate, trackOffset, applyAtServerTime); }
+  checkDrift(serverTime, trackPosition, hbRate = 1, rampActive = false) {
+    return this.ch[0].checkDrift(serverTime, trackPosition, hbRate, rampActive);
+  }
+  stopLocal(fade = 0.03) {
+    // Silence everything (leave, session end, queue stop).
+    this.ch[0].stopLocal(fade);
+    this.ch[1].stopLocal(fade);
+  }
+
+  // ---- deck API -----------------------------------------------------------
+  deck(id) { return this.ch[DECK_INDEX[id] ?? 0]; }
+  deckSetBuffer(id, buf) { this.deck(id).setBuffer(buf); }
+  deckScheduleAt(id, startAtServerTime, trackOffset, opts = {}) {
+    return this.deck(id).scheduleAt(startAtServerTime, trackOffset, false, opts.fadeIn || 0, { rate: opts.rate ?? 1 });
+  }
+  deckPause(id, position) { this.deck(id).pauseAt(position); }
+  deckStop(id, fade = 0.03) { this.deck(id).stopLocal(fade); }
+  deckSetRate(id, rate, trackOffset, applyAtServerTime) {
+    this.deck(id).setRate(rate, trackOffset, applyAtServerTime);
+  }
+  deckCheckDrift(id, serverTime, position, rate) {
+    return this.deck(id).checkDrift(serverTime, position, rate, false);
+  }
+  deckPlaying(id) { return this.deck(id).playing; }
+  deckPosition(id) { return this.deck(id).position(); }
+  deckIdealPosition(id) { return this.deck(id).idealPosition(); }
+  deckLastMsg(id) { return this.deck(id).lastPlayMsg; }
+
+  // Crossfader: −1 full A … +1 full B, equal-power. Applied at a server-fixed
+  // instant (converted to ctx time by the caller) with a short smoothing.
+  setXfader(x, applyCtx = 0) {
+    this._xfaderX = Math.min(1, Math.max(-1, x));
+    if (!this.ctx) return;
+    const t = (this._xfaderX + 1) / 2;
+    const at = Math.max(this.ctx.currentTime + 0.01, applyCtx || 0);
+    this.ch[0].out.gain.setTargetAtTime(Math.cos(t * Math.PI / 2), at, 0.04);
+    this.ch[1].out.gain.setTargetAtTime(Math.sin(t * Math.PI / 2), at, 0.04);
+  }
+
+  // Entering/leaving DECKS mode: route the crossfader or park it on the
+  // queue channel. Leaving also silences deck B.
+  setDecksActive(on) {
+    if (!this.ctx) { this._decksOn = on; return; }
+    this._decksOn = on;
+    if (on) {
+      this.setXfader(this._xfaderX === -1 ? 0 : this._xfaderX);
+    } else {
+      this.ch[1].stopLocal(0.05);
+      this._xfaderX = -1;
+      const t = this.ctx.currentTime;
+      this.ch[0].out.gain.setTargetAtTime(1, t, 0.04);
+      this.ch[1].out.gain.setTargetAtTime(0, t, 0.04);
+    }
+  }
+
+  setVolume(v) {
+    if (!this.master) return;
+    this.master.gain.setTargetAtTime(v, this.ctx.currentTime, 0.01);
+  }
+
+  // Live EQ/filter — applied by every device at the same server-fixed instant.
+  setFx(fx, applyCtx) {
+    this.fxState = fx;
+    if (!this.ctx) return;
+    const at = Math.max(this.ctx.currentTime + 0.01, applyCtx || 0);
+    const T = 0.04;
+    const db = (v, kill) => (kill ? -40 : (v || 0));
+    this.eqLow.gain.setTargetAtTime(db(fx.low, fx.killLow), at, T);
+    this.eqMid.gain.setTargetAtTime(db(fx.mid, fx.killMid), at, T);
+    this.eqHigh.gain.setTargetAtTime(db(fx.high, fx.killHigh), at, T);
+    const v = (fx.filter || 0) / 100;
+    const lpF = v < 0 ? 150 * Math.pow(20000 / 150, 1 + v) : 20000;
+    const hpF = v > 0 ? 20 * Math.pow(8000 / 20, v) : 20;
+    this.lp.frequency.setTargetAtTime(lpF, at, 0.06);
+    this.hp.frequency.setTargetAtTime(hpF, at, 0.06);
+  }
+
+  setCalibration(ms) {
+    this.calibrationMs = ms;
+    // Re-anchor every playing channel against its authoritative schedule.
+    for (const c of this.ch) {
+      if (c.playing && c.lastPlayMsg) {
+        const m = c.lastPlayMsg;
+        c.scheduleAt(m.startAtServerTime, m.trackOffset, m.click, 0.05, {
+          rate: m.rate, ramp: m.ramp,
+        });
+      }
+    }
   }
 }

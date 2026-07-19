@@ -1,6 +1,6 @@
 # sYntonia
 
-Turn a group of smartphones into one distributed sound system: a **lead** device uploads tracks into a queue, the others join with a 4-char code (or the shared session URL) and every speaker plays them in tight sync — auto-advancing through the playlist with repeat and shuffle.
+Turn a group of smartphones into one distributed sound system: a **lead** device uploads tracks into a queue, the others join with a 4-char code (or the shared session URL) and every speaker plays them in tight sync — auto-advancing through the playlist with repeat, shuffle and DJ-style **MIX MODE** transitions (BPM analysis, beatmatched crossfades, live EQ/filter/tempo).
 
 Node + Express + `ws` on the server, vanilla ES modules + Web Audio API on the client. No database, no build step, no frameworks. UI in Italian (EN switch in the header).
 
@@ -47,6 +47,46 @@ points:
   rows can never shift playback. Removing the playing track skips to its
   successor (or stops at the end of the queue with repeat off).
 
+## MIX MODE (lead-only DJ tools)
+
+A collapsible **MIX** panel in the lead view, inspired by djay's Automix and
+rekordbox's BPM readout, kept inside the app's core contract: **everything
+audible is a server-scheduled event** rendered identically by every device.
+Controls needing zero latency (scratching, jog wheels, headphone cueing) are
+deliberately out of scope. The whole module (`public/js/dj.js`) is loaded with
+a dynamic import **on the lead only** — satellites never download it, they just
+render the effects that arrive over the protocol.
+
+- **Track analysis.** After upload the lead decodes each track in the
+  background and estimates **BPM** (low-passed onset envelope →
+  autocorrelation with harmonic support → fine comb search with joint phase
+  estimation, 70–180 BPM), the **beat phase**, a waveform overview and a
+  loudness-normalization suggestion. No libraries, chunked on the main thread.
+  Results go to the server as `track-meta`: the queue shows BPM per track and
+  reconnecting clients get them back. Low-confidence results are marked (`~`)
+  and excluded from beatmatching.
+- **Deck.** Waveform of the current track with the beat grid overlaid,
+  brighter played portion, tap-to-seek, and **4 hot cues** per track (tap =
+  set/jump, hold = clear; stored server-side for the session).
+- **Transitions** between queue tracks: `CUT` (default, the classic gapless
+  handover), `2S/4S/8S` equal-power crossfades, or `BEAT`. Auto-advance places
+  the incoming start **fade seconds before the outgoing end**; a manual skip
+  starts the same transition immediately, djay-style. **Beatmatch**: if both
+  BPMs are confident and within ±8 % after octave folding, the incoming track
+  starts **on its first beat, snapped onto the outgoing beat grid, at the
+  outgoing tempo** (with a low-shelf EQ swap during the overlap), then glides
+  back to the master tempo over 4 s. Anything less certain degrades to a plain
+  4 s crossfade.
+- **Live controls**, all applied ~0.3 s in the future at a server-fixed
+  instant so every speaker changes together (declared in the UI): 3-band EQ
+  with per-band **KILL**, a bipolar one-knob **filter** (LP ← center → HP),
+  and **master tempo ±8 %** (timeline re-anchored server-side, clients glide
+  `playbackRate` — no restart).
+- **Sync math.** The playback rate is part of the server's authoritative
+  state; position is the exact integral of the (piecewise linear) rate, on
+  both server and clients. Drift correction pauses during rate glides and
+  resumes on the next constant-rate heartbeat.
+
 ## WebSocket protocol
 
 All session messages carry `sessionCode`; transport messages from satellites are ignored; malformed JSON never crashes the server.
@@ -57,15 +97,20 @@ All session messages carry `sessionCode`; transport messages from satellites are
 | `join` / `joined` | C→S / S→C | code+id ⇄ role, track, playback snapshot, peers |
 | `error` | S→C | `code`, `text` |
 | `peer-update` | S→C | count + `{id, role, ready, connected}` list |
-| `queue-update` | S→C | full queue + `currentTrackId`, `nextTrackId`, `repeatMode`, `shuffle`, `order`, `prefetch` |
-| `track-change` | S→C | `trackId`, `startAtServerTime`, `trackOffset` (play, seek, skip, auto-advance) |
+| `queue-update` | S→C | full queue (with `meta`, `cues`) + `currentTrackId`, `nextTrackId`, `repeatMode`, `shuffle`, `order`, `prefetch`, `transitionMode`, `tempo`, `fx` |
+| `track-change` | S→C | `trackId`, `startAtServerTime`, `trackOffset`, `rate`, `rateRamp`, `transition` (play, seek, skip, auto-advance) |
 | `client-ready` | C→S | `trackId` + decoded `duration` (per prefetched track) |
 | `play` / `pause` / `stop` / `seek` | C→S | lead transport (server re-emits `track-change` / `pause` / `stop`) |
 | `skip-next` / `skip-prev` | C→S | prev restarts the track when >3 s in |
 | `queue-remove` / `queue-reorder` | C→S | `trackId` / `from`,`to` |
 | `set-repeat` / `set-shuffle` | C→S | `mode: off\|all\|one` / `on: bool` |
+| `track-meta` | C→S | lead analysis: `trackId`, `bpm`, `confidence`, `beatPhase`, `gainDb` |
+| `set-transition` | C→S | `mode: cut\|fade2\|fade4\|fade8\|beatmatch` |
+| `set-tempo` / `rate-change` | C→S / S→C | `tempo` ⇄ `rate`, `trackOffset`, `applyAtServerTime` |
+| `fx-set` / `fx-update` | C→S / S→C | EQ dB + kills + `filter` ⇄ same + `applyAtServerTime` |
+| `cue-set` | C→S | `trackId`, `slot` 0-3, `position` (null clears) |
 | `click-start` / `click-stop` | C→S | calibration click track |
-| `position-heartbeat` | S→C | `serverTime`, `trackPosition` (5 s) |
+| `position-heartbeat` | S→C | `serverTime`, `trackPosition`, `rate`, `rampActive` (5 s) |
 | `position-request` | C→S | immediate heartbeat (after foregrounding) |
 | `timesync` | C↔S | `t0` ⇄ `t0`, `tServer` |
 | `session-ended` / `leave` | S→C / C→S | — |

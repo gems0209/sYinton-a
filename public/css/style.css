@@ -365,6 +365,79 @@ main {
 /* repeat / shuffle active = inversion */
 #btn-repeat.on, #btn-shuffle.on { background: var(--white); color: #000; border-color: var(--white); }
 
+/* ------------------------------------------------------------- MIX MODE
+   Lead-only DJ tools. Same grammar as the rest: monochrome, inversion for
+   active states, sliders reused as-is. */
+.mix summary .mix-bpm { margin-left: auto; color: var(--text2); letter-spacing: 0.1em; font-size: 0.72rem; }
+.mix-body { padding: 0.9rem 1rem; display: flex; flex-direction: column; gap: 0.9rem; }
+
+.deck {
+  display: block;
+  width: 100%;
+  height: 76px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.cue-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.4rem; }
+.cue-btn {
+  min-height: 44px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text2);
+  font-size: 0.62rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 80ms linear, color 80ms linear;
+  padding: 0 0.2rem;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.cue-btn:hover:not(:disabled) { background: var(--white); color: #000; }
+.cue-btn.set { background: var(--white); color: #000; border-color: var(--white); font-weight: 700; }
+.cue-btn:disabled { color: var(--disabled); border-color: var(--surface); cursor: default; }
+
+.mix-block { display: flex; flex-direction: column; gap: 0.5rem; }
+
+.seg { display: flex; }
+.seg button {
+  flex: 1;
+  min-height: 44px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-left-width: 0;
+  color: var(--text);
+  font-size: 0.72rem;
+  letter-spacing: 0.12em;
+  cursor: pointer;
+  transition: background 80ms linear, color 80ms linear;
+}
+.seg button:first-child { border-left-width: 1px; }
+.seg button:hover { background: var(--white); color: #000; }
+.seg button.on { background: var(--white); color: #000; border-color: var(--white); font-weight: 700; }
+
+.eq-row { display: grid; grid-template-columns: 64px 1fr 52px; gap: 0.6rem; align-items: center; }
+.eq-row input[type="range"] { min-width: 0; }
+.eq-val { color: var(--text2); font-size: 0.68rem; text-align: right; }
+.kill-btn {
+  min-height: 44px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text2);
+  font-size: 0.62rem;
+  letter-spacing: 0.12em;
+  cursor: pointer;
+  transition: background 80ms linear, color 80ms linear;
+}
+.kill-btn:hover { background: var(--white); color: #000; }
+.kill-btn.on { background: var(--white); color: #000; border-color: var(--white); font-weight: 700; text-decoration: line-through; }
+
+.q-bpm { color: var(--text2); flex: none; min-width: 2.4em; text-align: right; }
+.queue-row.active .q-bpm { color: #000; }
+
 .techline {
   font-size: 0.65rem;
   color: var(--disabled);

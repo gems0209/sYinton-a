@@ -118,6 +118,78 @@
         <ul class="queue-list" id="queue-list"></ul>
       </div>
 
+      <!-- MIX MODE — unhidden and driven by the lead-only dj.js module -->
+      <div id="mix-panel" hidden>
+        <details class="help mix" id="mix">
+          <summary>
+            <span class="help-q">≣</span>
+            <span data-i18n="mix_title">MIX</span>
+            <span class="mix-bpm num" id="mix-bpm"></span>
+          </summary>
+          <div class="mix-body">
+
+            <canvas id="deck" class="deck" aria-label="waveform"></canvas>
+            <div class="cue-row">
+              <button type="button" id="cue-0" class="cue-btn" disabled>CUE 1</button>
+              <button type="button" id="cue-1" class="cue-btn" disabled>CUE 2</button>
+              <button type="button" id="cue-2" class="cue-btn" disabled>CUE 3</button>
+              <button type="button" id="cue-3" class="cue-btn" disabled>CUE 4</button>
+            </div>
+            <span class="dim" data-i18n="mix_cue_hint"></span>
+
+            <div class="mix-block">
+              <span class="label" data-i18n="mix_transition">TRANSIZIONE</span>
+              <div class="seg">
+                <button type="button" id="tr-cut" class="on">CUT</button>
+                <button type="button" id="tr-fade2">2S</button>
+                <button type="button" id="tr-fade4">4S</button>
+                <button type="button" id="tr-fade8">8S</button>
+                <button type="button" id="tr-beatmatch">BEAT</button>
+              </div>
+            </div>
+
+            <div class="slider-row">
+              <label class="label" for="tempo"><span data-i18n="mix_tempo">TEMPO</span> <span class="num" id="tempo-val">100.0%</span></label>
+              <div class="cal-row">
+                <button type="button" id="btn-tempo-reset" class="cal-lock">100</button>
+                <input type="range" id="tempo" min="92" max="108" value="100" step="0.5">
+              </div>
+            </div>
+
+            <div class="mix-block">
+              <span class="label">EQ</span>
+              <div class="eq-row">
+                <button type="button" id="kill-low" class="kill-btn">LOW</button>
+                <input type="range" id="eq-low" min="-26" max="6" value="0" step="1">
+                <span class="num eq-val" id="eq-low-val">0DB</span>
+              </div>
+              <div class="eq-row">
+                <button type="button" id="kill-mid" class="kill-btn">MID</button>
+                <input type="range" id="eq-mid" min="-26" max="6" value="0" step="1">
+                <span class="num eq-val" id="eq-mid-val">0DB</span>
+              </div>
+              <div class="eq-row">
+                <button type="button" id="kill-high" class="kill-btn">HIGH</button>
+                <input type="range" id="eq-high" min="-26" max="6" value="0" step="1">
+                <span class="num eq-val" id="eq-high-val">0DB</span>
+              </div>
+            </div>
+
+            <div class="slider-row">
+              <label class="label" for="filter"><span data-i18n="mix_filter">FILTRO</span> <span class="num" id="filter-val">—</span></label>
+              <input type="range" id="filter" min="-100" max="100" value="0" step="1">
+              <span class="dim" data-i18n="mix_filter_hint"></span>
+            </div>
+
+            <div class="spec-row">
+              <button type="button" id="btn-fx-reset" class="ghost">RESET FX</button>
+              <span class="dim" data-i18n="mix_note"></span>
+            </div>
+
+          </div>
+        </details>
+      </div>
+
       <div class="spec-row">
         <button type="button" id="btn-click" class="ghost" data-i18n="click_start">CLICK TRACK</button>
         <span class="dim" id="click-hint" data-i18n="click_hint" hidden></span>

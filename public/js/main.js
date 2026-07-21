@@ -286,6 +286,9 @@ ws.onstatus = (st) => {
 
 ws.on('_open', async () => {
   // Fresh socket (first connect or reconnect): full clock resync, then rejoin.
+  // Snap, don't smooth — the server process may have restarted (redeploy) while
+  // we were away, resetting its clock; a stale offset would desync playback.
+  clock.reset();
   await clock.burst(ws._everSynced ? 10 : 20);
   ws._everSynced = true;
   clock.startPeriodic();

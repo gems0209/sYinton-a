@@ -12,10 +12,16 @@
 // burst of samples (discard high-RTT, median of offsets) — see public/js/clocksync.js.
 //
 // performance.now() is monotonic (immune to NTP steps / wall-clock changes),
-// which is exactly what a playback scheduler needs.
+// which is exactly what a playback scheduler needs — but on its own it counts
+// milliseconds since THIS process started, so it resets to ~0 on every restart
+// or redeploy. That would shift the scheduler clock by the previous uptime and
+// desync every client still holding an offset from the old run. Anchoring to
+// the wall clock once at startup keeps now() continuous across restarts
+// (re-anchored to real time each launch) while staying monotonic within a run.
 const { performance } = require('perf_hooks');
 
-const now = () => performance.now();
+const EPOCH_MS = Date.now() - performance.now(); // wall-clock time of now()'s origin
+const now = () => EPOCH_MS + performance.now();
 
 function handleTimesync(ws, msg) {
   if (typeof msg.t0 !== 'number') return;

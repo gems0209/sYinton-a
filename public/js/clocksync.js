@@ -9,6 +9,12 @@
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// A fresh estimate this far from the current offset is not drift — it's a
+// discontinuity (the server process restarted and its monotonic clock reset, or
+// this device was asleep). Snap to it instead of smoothing, which would take
+// many 30 s bursts to catch up and leave playback desynced meanwhile.
+const CLOCK_JUMP_MS = 500;
+
 function median(arr) {
   const a = [...arr].sort((x, y) => x - y);
   const m = a.length >> 1;
@@ -64,7 +70,9 @@ export class ClockSync {
     const estimate = median(kept.map((s) => s.offset));
     const minRtt = Math.min(...samples.map((s) => s.rtt));
 
-    if (!this.synced) {
+    if (!this.synced || Math.abs(estimate - this.offset) > CLOCK_JUMP_MS) {
+      // First sync, a fresh reconnect, or a discontinuity (server restart /
+      // device wake): snap straight to the estimate.
       this.offset = estimate;
     } else {
       // Exponential smoothing: absorbs system-clock drift without step changes
@@ -75,6 +83,14 @@ export class ClockSync {
     this.uncertainty = minRtt / 2;
     this.synced = true;
     return true;
+  }
+
+  // Drop the current fix so the NEXT burst snaps instead of smoothing. Called on
+  // every reconnect: the server (and its monotonic clock) may have restarted
+  // while we were away, so the old offset can't be trusted as a drift baseline.
+  reset() {
+    this.synced = false;
+    this.uncertainty = Infinity;
   }
 
   // Light re-sync burst every 30 s to track clock drift.

@@ -316,6 +316,19 @@
         </div>
       </div>
 
+      <!-- MULTI-ZONE — optional: assign each phone a stereo channel + band + trim. -->
+      <div class="mz-block">
+        <button type="button" id="btn-multizone" class="lights-toggle">MULTI-ZONA: OFF</button>
+        <div id="multizone-controls" class="multizone-controls" hidden>
+          <div class="mz-presets">
+            <button type="button" id="mz-preset-stereo" data-i18n="mz_stereo">STEREO L/R</button>
+            <button type="button" id="mz-preset-reset" data-i18n="mz_reset">AZZERA</button>
+          </div>
+          <ul class="mz-list" id="mz-list"></ul>
+          <span class="dim" data-i18n="mz_note"></span>
+        </div>
+      </div>
+
       <!-- JUKEBOX — the crowd proposes tracks, the lead approves into the queue. -->
       <div class="jukebox-panel" id="jukebox">
         <div class="jukebox-head">
@@ -368,6 +381,12 @@
         </div>
         <span class="dim" id="sat-jukebox-empty" data-i18n="jb_sat_empty"></span>
         <ul class="jukebox-list" id="sat-jukebox-list"></ul>
+      </div>
+
+      <!-- MULTI-ZONE — read-only badge of this phone's assigned zone. -->
+      <div class="sat-multizone" id="sat-multizone" hidden>
+        <span class="label" data-i18n="mz_your_zone">LA TUA ZONA</span>
+        <span class="mz-zone-text num" id="sat-zone-text">—</span>
       </div>
 
       <div class="sliders">

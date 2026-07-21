@@ -166,6 +166,33 @@ lead sees the list ranked by votes and **approves** a proposal into the queue
   dismiss) is answered with a single `jukebox-update` snapshot; late joiners
   get the pool (and the light-show look) in their `joined` message.
 
+## Multi-zone (optional spatial mode)
+
+Turn the phones into a real rig: the lead assigns each device a **zone** that
+shapes only *its own output* — a stereo **channel** (full / left / right), a
+frequency **band** (full / low / mid / high) and a gain trim. Put the phones on
+the left on the L channel and the right ones on R, or dedicate a group to the
+bass and another to the highs. Only makes sense because the app is distributed.
+
+It's an **optional mode, off by default**: with multi-zone off every device
+outputs full-range, centred, unity gain — bit-identical to normal playback. And
+it's **orthogonal** — it layers under the queue, MIX and DUAL DECK without
+touching the sync timeline (a zone is a per-device output stage, not a scheduled
+event, so it's applied locally with a short anti-click ramp — no `applyAt`).
+
+- **The output stage.** After the mix bus the signal fans out to a pure
+  analyser **tap** (so every device's WaveField + light-show level still see the
+  full mix) and to the zone stage: a channel selector (`ChannelSplitter` + three
+  gains — on a mono phone speaker "left" means "emit the track's LEFT channel",
+  so a room of phones splits the stereo image in space), an HP+LP band pair, and
+  a gain trim, then the master volume. The calibration click sits after the zone
+  so it stays full-range and volume-controlled on any band assignment.
+- **Assigning.** The lead's device list grows per-device controls (channel /
+  band / gain) plus **STEREO** (auto L/R by join index) and **RESET** presets.
+  Satellites just show a read-only badge of their zone. Assignments persist
+  across an off/on toggle and ride the `joined` snapshot for late joiners; a
+  gone device's zone is pruned.
+
 ## WebSocket protocol
 
 All session messages carry `sessionCode`; transport messages from satellites are ignored; malformed JSON never crashes the server.
@@ -173,7 +200,7 @@ All session messages carry `sessionCode`; transport messages from satellites are
 | Type | Dir | Payload |
 |---|---|---|
 | `create` / `created` | C→S / S→C | `clientId` ⇄ `sessionCode` |
-| `join` / `joined` | C→S / S→C | code+id ⇄ role, `deviceIndex`, snapshots (queue, playback, peers, `lightshow`, `jukebox`) |
+| `join` / `joined` | C→S / S→C | code+id ⇄ role, `deviceIndex`, snapshots (queue, playback, peers, `lightshow`, `jukebox`, `multizone`) |
 | `error` | S→C | `code`, `text` |
 | `peer-update` | S→C | count + `{id, role, deviceIndex, name, ready, connected}` list |
 | `queue-update` | S→C | full queue (with `meta`, `cues`) + `currentTrackId`, `nextTrackId`, `repeatMode`, `shuffle`, `order`, `prefetch`, `transitionMode`, `tempo`, `fx` |
@@ -200,6 +227,9 @@ All session messages carry `sessionCode`; transport messages from satellites are
 | `vote-proposal` | C→S | toggle this device's vote on `proposalId` (any role) |
 | `approve-proposal` / `dismiss-proposal` | C→S | lead: `proposalId` (+ `mode: end\|next`) → queue / delete |
 | `jukebox-update` | S→C | `{open, proposals:[{id, name, note, byName, votes, voterIds}]}` |
+| `multizone-set` | C→S | lead toggles the spatial mode (`on`) |
+| `zone-assign` | C→S | lead: `clientId` + `{channel, band, gain}` (neutral clears it) |
+| `multizone-update` | S→C | `{on, zones:{clientId → {channel, band, gain}}}` |
 | `click-start` / `click-stop` | C→S | calibration click track (refused in DECKS mode) |
 | `position-heartbeat` | S→C | `serverTime`, `trackPosition`, `rate`, `rampActive`, `decks{A,B}` (5 s) |
 | `position-request` | C→S | immediate heartbeat (after foregrounding) |

@@ -698,6 +698,58 @@ main {
 .sat-jukebox .queue-head { padding: 0.7rem 1rem; border-bottom: 1px solid var(--border); }
 #jukebox-empty, #sat-jukebox-empty { display: block; padding: 0.7rem 1rem; }
 
+/* ------------------------------------------------------------ MULTI-ZONE */
+.mz-block { display: flex; flex-direction: column; gap: 0.6rem; }
+.multizone-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+  border: 1px solid var(--border);
+  padding: 0.8rem;
+}
+.mz-presets { display: flex; gap: 0.5rem; }
+.mz-presets button {
+  flex: 1;
+  min-height: 44px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.7rem;
+  cursor: pointer;
+  transition: background 80ms linear, color 80ms linear;
+}
+.mz-presets button:hover { background: var(--white); color: #000; }
+.mz-list { list-style: none; display: flex; flex-direction: column; gap: 0.7rem; }
+.mz-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  border: 1px solid var(--surface);
+  padding: 0.5rem 0.6rem;
+}
+.mz-dev {
+  font-size: 0.7rem;
+  letter-spacing: 0.1em;
+  color: var(--white);
+  text-transform: uppercase;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mz-seg button { font-size: 0.6rem; letter-spacing: 0.04em; padding: 0 0.15rem; min-height: 40px; }
+.mz-gain { display: flex; align-items: center; gap: 0.6rem; }
+.mz-gain-val { color: var(--text2); font-size: 0.66rem; min-width: 2.6em; text-align: right; }
+.mz-gain input[type="range"] { flex: 1; min-width: 0; }
+.sat-multizone {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+  border: 1px solid var(--border);
+  padding: 0.8rem 1rem;
+}
+.mz-zone-text { color: var(--white); letter-spacing: 0.14em; font-size: 0.8rem; }
+
 .techline {
   font-size: 0.65rem;
   color: var(--disabled);

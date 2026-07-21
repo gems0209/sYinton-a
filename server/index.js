@@ -367,6 +367,10 @@ function handleDisconnect(ws) {
       const c = session.clients.get(clientId);
       if (c && !c.connected) {
         session.clients.delete(clientId);
+        if (session.multizone.zones[clientId]) {
+          delete session.multizone.zones[clientId]; // drop a gone device's zone
+          S.broadcastMultizone(session);
+        }
         S.broadcastPeers(session);
       }
     }, S.RECONNECT_GRACE_MS);
@@ -410,6 +414,7 @@ const HANDLERS = {
       peers: S.peerList(session),
       lightshow: session.lightshow,               // late join picks up the current look
       jukebox: S.jukeboxSnapshot(session),        // …and the current request pool
+      multizone: S.multizoneSnapshot(session),    // …and any spatial-zone assignment
     });
     S.broadcastPeers(session);
   },
@@ -923,6 +928,31 @@ const HANDLERS = {
     S.broadcastJukebox(session);
   },
 
+  // ---- MULTI-ZONE: optional spatial mode (lead-only). Purely a per-device
+  // OUTPUT shaping — the sync timeline is untouched, so no scheduled instant.
+  'multizone-set'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    session.multizone.on = !!msg.on;
+    S.broadcastMultizone(session);
+  },
+
+  // Assign one device's zone (channel + band + gain). Unknown clients are
+  // still allowed (they may reconnect); values are validated + clamped.
+  'zone-assign'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    if (typeof msg.clientId !== 'string' || !msg.clientId) return;
+    const z = msg.zone || {};
+    const channel = S.ZONE_CHANNELS.includes(z.channel) ? z.channel : 'full';
+    const band = S.ZONE_BANDS.includes(z.band) ? z.band : 'full';
+    const gain = (typeof z.gain === 'number' && isFinite(z.gain)) ? Math.min(1, Math.max(0, z.gain)) : 1;
+    if (channel === 'full' && band === 'full' && gain === 1) {
+      delete session.multizone.zones[msg.clientId]; // neutral = no entry
+    } else {
+      session.multizone.zones[msg.clientId] = { channel, band, gain };
+    }
+    S.broadcastMultizone(session);
+  },
+
   // Calibration click track — generated locally by every client, scheduled
   // like a normal track; the queue is untouched.
   'click-start'(ws, msg, session, client) {
@@ -972,6 +1002,7 @@ const SESSION_SCOPED = new Set([
   'decks-mode', 'deck-load', 'deck-play', 'deck-pause', 'deck-seek', 'deck-rate', 'deck-sync', 'xfader',
   'set-nickname', 'lightshow-set',
   'jukebox-set', 'vote-proposal', 'approve-proposal', 'dismiss-proposal',
+  'multizone-set', 'zone-assign',
   'click-start', 'click-stop', 'position-request', 'leave',
 ]);
 

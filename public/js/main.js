@@ -7,6 +7,7 @@ import { loadCalibration, saveCalibration } from './calibration.js';
 import { t, apply as applyI18n, setLang, onLangChange } from './i18n.js';
 import * as lightshow from './lightshow.js';
 import * as jukebox from './jukebox.js';
+import * as multizone from './multizone.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -46,6 +47,7 @@ const S = {
   fx: null,              // MIX: live EQ/filter state (server-owned)
   decks: null,           // DUAL DECK snapshot {on, xfader, A, B} (server-owned)
   jukebox: null,         // JUKEBOX snapshot {open, proposals} (server-owned)
+  multizone: null,       // MULTI-ZONE snapshot {on, zones} (server-owned)
   deviceIndex: 0,        // this device's stable index (light show / attribution)
   playback: { status: 'idle' },
   peers: [],
@@ -95,7 +97,9 @@ function showView(name) {
     S.code = null;
     S.decks = null;
     S.jukebox = null;
-    lightshow.hide(); // stop painting + drop the full-screen overlay
+    S.multizone = null;
+    lightshow.hide();              // stop painting + drop the full-screen overlay
+    player.setMultizoneActive(false); // back to neutral output
     bufferCache.clear();
     safeRemove(sessionStorage, 'wavepool-session');
     if (location.pathname !== '/debug') history.replaceState(null, '', '/');
@@ -191,6 +195,7 @@ async function requestWakeLock() {
 // satellites render. Both are small and imported statically.
 lightshow.init({ S, ws, player, t, flash });
 jukebox.init({ S, ws, player, t, flash });
+multizone.init({ S, ws, player, t });
 
 // ------------------------------------------------------------------ i18n ---
 applyI18n();
@@ -207,6 +212,7 @@ onLangChange(() => {
   if (dj) dj.onQueue(); // MIX labels re-render
   lightshow.refresh();  // toggle/pattern labels
   jukebox.render();     // jukebox labels
+  multizone.render();   // zone labels
 });
 
 // ------------------------------------------------------------------ home ---
@@ -283,9 +289,11 @@ ws.on('created', (msg) => {
 ws.on('joined', (msg) => {
   if (typeof msg.deviceIndex === 'number') S.deviceIndex = msg.deviceIndex;
   enterSession(msg.sessionCode, msg.role, msg.queue, msg.playback, msg.peers);
-  // Late join / reconnect: adopt the current light-show look and request pool.
+  // Late join / reconnect: adopt the current light-show look, request pool and
+  // spatial-zone assignment (this device applies its own zone).
   if (msg.lightshow) lightshow.set(msg.lightshow);
   jukebox.apply(msg.jukebox || { open: false, proposals: [] });
+  multizone.apply(msg.multizone || { on: false, zones: {} });
 });
 
 ws.on('error', (msg) => {
@@ -309,6 +317,7 @@ ws.on('peer-update', (msg) => {
   const me = msg.peers.find((p) => p.id === S.clientId);
   if (me) S.deviceIndex = me.deviceIndex; // used by the light show's spatial patterns
   renderPeers();
+  multizone.render(); // the assignment grid tracks who's connected
 });
 
 ws.on('queue-update', (msg) => {
@@ -372,6 +381,10 @@ ws.on('lightshow-update', (msg) => lightshow.set(msg.lightshow));
 
 // Jukebox: the request pool changed (open/close, new proposal, vote, approve).
 ws.on('jukebox-update', (msg) => jukebox.apply(msg.jukebox));
+
+// Multi-zone: the mode toggled or a device's zone changed. Each client applies
+// its own zone; the lead re-renders the assignment grid.
+ws.on('multizone-update', (msg) => multizone.apply(msg.multizone));
 
 // ------------------------------------------------------------- DUAL DECK --
 // One reconciler for everything deck-related: every decks-update (and the
@@ -599,6 +612,7 @@ function enterSession(code, role, queueSnapshot, playback, peers) {
   requestWakeLock();
   jukebox.onEnter();   // re-assert saved nickname + render the request pool
   lightshow.refresh(); // role is known now → correct overlay/controls
+  multizone.render();  // render the zone toggle / badge for this role
   // Late join into running playback: handled by ensureBuffers → ensurePlaying.
 }
 

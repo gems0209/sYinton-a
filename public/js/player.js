@@ -381,15 +381,16 @@ export class SyncPlayer {
     if (this.ctx) return;
     const AC = window.AudioContext || window.webkitAudioContext;
     this.ctx = new AC();
-    this.master = this.ctx.createGain();
+    this.master = this.ctx.createGain(); // volume — now the LAST stage (post-zone)
+    this.bus = this.ctx.createGain();    // full post-fx mix: analyser tap + zone input
     this.analyser = this.ctx.createAnalyser();
     this.analyser.fftSize = 1024;
     this.analyser.smoothingTimeConstant = 0.85;
 
     // MIX fx chain, identical on every device (the lead drives it, satellites
     // render it): channels → crossfader legs → fxInput → 3-band EQ → bipolar
-    // filter (HP+LP) → master (volume) → analyser → destination. Everything
-    // is sonically neutral at rest.
+    // filter (HP+LP) → bus. The bus feeds the analyser (a tap) and the optional
+    // MULTI-ZONE stage → master (volume) → output. Everything neutral at rest.
     this.fxInput = this.ctx.createGain();
     this.eqLow = this.ctx.createBiquadFilter();
     this.eqLow.type = 'lowshelf';
@@ -412,7 +413,7 @@ export class SyncPlayer {
     this.eqMid.connect(this.eqHigh);
     this.eqHigh.connect(this.hp);
     this.hp.connect(this.lp);
-    this.lp.connect(this.master);
+    this.lp.connect(this.bus);
 
     // Crossfader legs. Queue mode: channel 0 full, channel 1 silent.
     for (const c of this.ch) {
@@ -422,18 +423,25 @@ export class SyncPlayer {
     this.ch[0].out.gain.value = 1;
     this.ch[1].out.gain.value = 0;
 
-    this.master.connect(this.analyser);
+    // Output end. iOS routes the final mix through an <audio> element to dodge
+    // the hardware silent switch; everyone else goes straight to destination.
     if (IS_IOS) {
-      // iOS mutes raw Web Audio output with the hardware silent switch, but
-      // treats <audio>-element playback as "media" and lets it through.
       this.mediaDest = this.ctx.createMediaStreamDestination();
-      this.analyser.connect(this.mediaDest);
+      this.outNode = this.mediaDest;
       this.audioEl = document.createElement('audio');
       this.audioEl.setAttribute('playsinline', '');
       this.audioEl.srcObject = this.mediaDest.stream;
     } else {
-      this.analyser.connect(this.ctx.destination);
+      this.outNode = this.ctx.destination;
     }
+    // The analyser is a pure TAP off the full post-fx mix (bus), so the
+    // WaveField + light-show level see the same thing on every device. The
+    // audio itself flows through the MULTI-ZONE stage (neutral at rest) and
+    // the master volume. The calibration click connects to master (post-zone),
+    // so it stays full-range and volume-controlled on any band assignment.
+    this.bus.connect(this.analyser);
+    this._buildZoneStage();          // bus → [channel][band][trim] → master
+    this.master.connect(this.outNode);
     if (this.fxState) this.setFx(this.fxState, 0);
     this._sampleMap();
     setInterval(() => this._sampleMap(), 2000);
@@ -597,6 +605,76 @@ export class SyncPlayer {
     const hpF = v > 0 ? 20 * Math.pow(8000 / 20, v) : 20;
     this.lp.frequency.setTargetAtTime(lpF, at, 0.06);
     this.hp.frequency.setTargetAtTime(hpF, at, 0.06);
+  }
+
+  // ---- MULTI-ZONE: optional per-device output shaping -----------------------
+  // One stage after the mix: pick a stereo channel (full / left / right), a
+  // frequency band (full / low / mid / high) and a gain trim. Neutral at rest,
+  // so a device is bit-identical to today until the lead assigns it a zone.
+  // On a mono phone speaker "left" means "emit the track's LEFT channel", so a
+  // room of phones splits the stereo image spatially.
+  _buildZoneStage() {
+    const ctx = this.ctx;
+    this.zoneIn = ctx.createGain();
+    this._zoneSplit = ctx.createChannelSplitter(2);
+    this._zFull = ctx.createGain(); // full stereo passthrough
+    this._zL = ctx.createGain();    // left channel only (up-mixed to output)
+    this._zR = ctx.createGain();    // right channel only
+    const sum = ctx.createGain();
+    this._zoneHP = ctx.createBiquadFilter();
+    this._zoneHP.type = 'highpass';
+    this._zoneHP.frequency.value = 20;
+    this._zoneLP = ctx.createBiquadFilter();
+    this._zoneLP.type = 'lowpass';
+    this._zoneLP.frequency.value = 20000;
+    this._zoneGain = ctx.createGain();
+
+    this.bus.connect(this.zoneIn);
+    this.zoneIn.connect(this._zFull);
+    this.zoneIn.connect(this._zoneSplit);
+    this._zoneSplit.connect(this._zL, 0);
+    this._zoneSplit.connect(this._zR, 1);
+    this._zFull.connect(sum);
+    this._zL.connect(sum);
+    this._zR.connect(sum);
+    sum.connect(this._zoneHP);
+    this._zoneHP.connect(this._zoneLP);
+    this._zoneLP.connect(this._zoneGain);
+    this._zoneGain.connect(this.master);
+
+    this._zFull.gain.value = 1; // neutral: full stereo, full band, unity
+    this._zL.gain.value = 0;
+    this._zR.gain.value = 0;
+    this._mzOn = false;
+    this._zone = { channel: 'full', band: 'full', gain: 1 };
+  }
+
+  setMultizoneActive(on) {
+    this._mzOn = !!on;
+    if (!on) this._applyZone({ channel: 'full', band: 'full', gain: 1 });
+  }
+
+  setZone(zone) {
+    if (this._mzOn) this._applyZone(zone || { channel: 'full', band: 'full', gain: 1 });
+  }
+
+  _applyZone(z) {
+    if (!this.ctx || !this._zoneGain) return;
+    const t = this.ctx.currentTime;
+    const ch = z.channel || 'full';
+    this._zFull.gain.setTargetAtTime(ch === 'full' ? 1 : 0, t, 0.03);
+    this._zL.gain.setTargetAtTime(ch === 'left' ? 1 : 0, t, 0.03);
+    this._zR.gain.setTargetAtTime(ch === 'right' ? 1 : 0, t, 0.03);
+    const band = z.band || 'full';
+    const [hp, lp] = band === 'low' ? [20, 180]
+      : band === 'mid' ? [180, 2000]
+        : band === 'high' ? [2000, 20000]
+          : [20, 20000];
+    this._zoneHP.frequency.setTargetAtTime(hp, t, 0.05);
+    this._zoneLP.frequency.setTargetAtTime(lp, t, 0.05);
+    const g = typeof z.gain === 'number' ? Math.min(1, Math.max(0, z.gain)) : 1;
+    this._zoneGain.gain.setTargetAtTime(g, t, 0.03);
+    this._zone = { channel: ch, band, gain: g };
   }
 
   setCalibration(ms) {

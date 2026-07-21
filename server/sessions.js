@@ -60,6 +60,12 @@ const newLightshow = () => ({
 const JUKEBOX_MAX_PER_DEVICE = 3;   // pending proposals a single device may hold
 const JUKEBOX_MAX_TOTAL = 20;       // pending proposals across the whole session
 
+// ---- MULTI-ZONE constants ---------------------------------------------------
+// Optional spatial mode: each device shapes only its OWN output (stereo channel
+// + frequency band + gain trim). The sync timeline is untouched.
+const ZONE_CHANNELS = ['full', 'left', 'right'];
+const ZONE_BANDS = ['full', 'low', 'mid', 'high'];
+
 const UPLOAD_ROOT = path.join(__dirname, '..', 'uploads');
 
 const sessions = new Map(); // code -> session
@@ -117,6 +123,9 @@ function create(leadClientId) {
     // approves them into the queue. proposals: [{ id, filePath, name, note,
     // byId, byIndex, size, votes:Set<clientId>, createdAt }].
     jukebox: { open: false, proposals: [] },
+    // Optional spatial mode: per-device output shaping, keyed by clientId.
+    // Off by default and fully additive — the sync timeline is untouched.
+    multizone: { on: false, zones: {} }, // zones[clientId] = {channel, band, gain}
     advanceWaitSince: null, // set while waiting for clients to buffer the next track
     orphanTimer: null,
     lastActivity: Date.now(),
@@ -394,6 +403,16 @@ function broadcastJukebox(session) {
   broadcast(session, { type: 'jukebox-update', jukebox: jukeboxSnapshot(session) });
 }
 
+// ---- MULTI-ZONE -------------------------------------------------------------
+// The whole zone map is broadcast: the lead needs every device's assignment for
+// its UI, each satellite just applies zones[its own clientId] (or neutral).
+function multizoneSnapshot(session) {
+  return { on: session.multizone.on, zones: session.multizone.zones };
+}
+function broadcastMultizone(session) {
+  broadcast(session, { type: 'multizone-update', multizone: multizoneSnapshot(session) });
+}
+
 // Insert an approved proposal into the live queue as a first-class track:
 // 'end' appends (shuffle: fair random spot in the unplayed tail, like upload),
 // 'next' drops it right after the current track (and after it in the shuffle
@@ -466,6 +485,8 @@ module.exports = {
   jukeboxSnapshot,
   broadcastJukebox,
   insertTrack,
+  multizoneSnapshot,
+  broadcastMultizone,
   deleteTrackFile,
   destroy,
   cleanupStale,
@@ -491,4 +512,6 @@ module.exports = {
   newLightshow,
   JUKEBOX_MAX_PER_DEVICE,
   JUKEBOX_MAX_TOTAL,
+  ZONE_CHANNELS,
+  ZONE_BANDS,
 };

@@ -19,6 +19,10 @@ const analyzed = new Set(); // ids already pumped (success or failure)
 const peaksCache = new Map(); // trackId -> Float32Array(640) — local only
 
 const send = (obj) => E.ws.send({ sessionCode: E.S.code, ...obj });
+// Resume this device's AudioContext on the click gesture before starting a
+// deck. In DECKS mode the main PLAY (which normally arms audio) is never
+// pressed, so without this a suspended context silently schedules nothing.
+const arm = (fn) => { if (E && E.arm) E.arm(fn); else fn(); };
 
 // ---------------------------------------------------------------- analysis --
 // Onset-energy autocorrelation on a low-passed mono mix, then a fine comb
@@ -526,7 +530,7 @@ function wireStrip(id) {
     const d = deckState(id);
     if (!d) return;
     if (d.status === 'playing') send({ type: 'deck-pause', deck: id });
-    else send({ type: 'deck-play', deck: id });
+    else arm(() => send({ type: 'deck-play', deck: id }));
   });
   $(`deck${id}-sync`).addEventListener('click', () => send({ type: 'deck-sync', deck: id }));
   $(`deck${id}-reset`).addEventListener('click', () => {
@@ -600,8 +604,9 @@ function wireDecks() {
     // click either acts or says precisely why — never a silent no-op.
     const usable = (tr) => tr.meta && tr.meta.bpm && (tr.meta.confidence || 0) >= 0.2;
     if (!usable(a) || !usable(b)) return E.flash(t('bm_need_bpm'));
-    send({ type: 'deck-beatmatch' });
-    E.flash(t('bm_syncing')); // honest in-progress; the change (or an error) follows
+    // Arm audio on the gesture, then fire — a suspended context (common in
+    // deck mode) would otherwise start nothing on this device.
+    arm(() => { send({ type: 'deck-beatmatch' }); E.flash(t('bm_syncing')); });
   });
   wireStrip('A');
   wireStrip('B');

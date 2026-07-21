@@ -143,6 +143,12 @@ $('arm-overlay').addEventListener('click', async () => {
   const fn = armPending;
   armPending = null;
   if (fn) fn();
+  // Recover everything the suspended context missed — not just the single
+  // pending action. Two decks each queue an arm, and the later overwrites the
+  // earlier; re-running the authoritative reconcilers starts BOTH (and the
+  // queue) once audio is finally live.
+  ensurePlaying();
+  healDecks();
 });
 
 function armThen(fn) {
@@ -624,7 +630,7 @@ function enterSession(code, role, queueSnapshot, playback, peers) {
     // MIX MODE tools load only here — satellites never fetch the module.
     if (!dj) {
       import('./dj.js')
-        .then((m) => { dj = m; dj.init({ S, ws, player, bufferCache, flash }); })
+        .then((m) => { dj = m; dj.init({ S, ws, player, bufferCache, flash, arm: armThen }); })
         .catch(() => { /* MIX tools are optional: playback works without them */ });
     } else {
       dj.onQueue();

@@ -260,6 +260,72 @@
         </details>
       </div>
 
+      <!-- LIGHT SHOW — the lead picks a look; every screen becomes a synced
+           light. The lead keeps its controls + a small preview swatch. -->
+      <div class="ls-block">
+        <div class="ls-toggle-row">
+          <button type="button" id="btn-lights" class="lights-toggle">LUCI: OFF</button>
+          <span class="ls-preview" id="ls-preview" aria-hidden="true"></span>
+        </div>
+        <div id="lightshow-controls" class="lightshow-controls" hidden>
+          <div class="mix-block">
+            <span class="label" data-i18n="ls_pattern">EFFETTO</span>
+            <div class="seg ls-seg">
+              <button type="button" data-ls-pattern="pulse" data-i18n="lsp_pulse">PULSE</button>
+              <button type="button" data-ls-pattern="colorbeat" data-i18n="lsp_colorbeat">COLORE</button>
+              <button type="button" data-ls-pattern="wave" data-i18n="lsp_wave">ONDA</button>
+              <button type="button" data-ls-pattern="breathe" data-i18n="lsp_breathe">RESPIRO</button>
+              <button type="button" data-ls-pattern="strobe" data-i18n="lsp_strobe">STROBO</button>
+            </div>
+          </div>
+          <div class="mix-block">
+            <span class="label" data-i18n="ls_palette">COLORI</span>
+            <div class="seg ls-seg">
+              <button type="button" data-ls-palette="spectrum" data-i18n="lspal_spectrum">SPETTRO</button>
+              <button type="button" data-ls-palette="mono" data-i18n="lspal_mono">MONO</button>
+              <button type="button" data-ls-palette="warm" data-i18n="lspal_warm">CALDO</button>
+              <button type="button" data-ls-palette="cool" data-i18n="lspal_cool">FREDDO</button>
+            </div>
+          </div>
+          <div class="mix-block">
+            <span class="label" data-i18n="ls_source">SORGENTE</span>
+            <div class="seg ls-seg">
+              <button type="button" data-ls-source="auto" data-i18n="lssrc_auto">AUTO</button>
+              <button type="button" data-ls-source="beat" data-i18n="lssrc_beat">BEAT</button>
+              <button type="button" data-ls-source="level" data-i18n="lssrc_level">VOLUME</button>
+            </div>
+          </div>
+          <div class="mix-block">
+            <span class="label" data-i18n="ls_div">RITMO</span>
+            <div class="seg ls-seg">
+              <button type="button" data-ls-div="bar" data-i18n="lsdiv_bar">BATTUTA</button>
+              <button type="button" data-ls-div="beat" data-i18n="lsdiv_beat">BEAT</button>
+              <button type="button" data-ls-div="half">½</button>
+              <button type="button" data-ls-div="quarter">¼</button>
+            </div>
+          </div>
+          <div class="slider-row">
+            <label class="label" for="ls-intensity" data-i18n="ls_intensity">INTENSITÀ</label>
+            <input type="range" id="ls-intensity" min="0" max="100" value="100" step="1">
+          </div>
+          <div class="slider-row">
+            <label class="label" for="ls-floor" data-i18n="ls_floor">LUCE BASE</label>
+            <input type="range" id="ls-floor" min="0" max="60" value="12" step="1">
+          </div>
+          <span class="dim" data-i18n="ls_note"></span>
+        </div>
+      </div>
+
+      <!-- JUKEBOX — the crowd proposes tracks, the lead approves into the queue. -->
+      <div class="jukebox-panel" id="jukebox">
+        <div class="jukebox-head">
+          <button type="button" id="btn-jukebox" class="jukebox-toggle">JUKEBOX: CHIUSO</button>
+          <span class="label"><span data-i18n="jb_requests">RICHIESTE</span>: <span id="jukebox-count" class="num">00</span></span>
+        </div>
+        <span class="dim" id="jukebox-empty" data-i18n="jb_empty"></span>
+        <ul class="jukebox-list" id="jukebox-list"></ul>
+      </div>
+
       <div class="spec-row">
         <button type="button" id="btn-click" class="ghost" data-i18n="click_start">CLICK TRACK</button>
         <span class="dim" id="click-hint" data-i18n="click_hint" hidden></span>
@@ -289,6 +355,19 @@
       <div class="queue-panel" id="sat-queue-panel" hidden>
         <div class="queue-head label"><span data-i18n="queue_title">CODA</span>: <span id="sat-queue-count" class="num">00</span></div>
         <ul class="queue-list" id="sat-queue-list"></ul>
+      </div>
+
+      <!-- JUKEBOX — visible only when the lead opens requests. -->
+      <div class="sat-jukebox" id="sat-jukebox" hidden>
+        <div class="queue-head label" data-i18n="jb_requests">RICHIESTE</div>
+        <div class="jukebox-compose">
+          <input type="text" id="jukebox-nick" class="jb-input" maxlength="16" autocomplete="off" data-i18n-ph="jb_nick_ph" placeholder="IL TUO NOME">
+          <input type="text" id="jukebox-note" class="jb-input" maxlength="80" autocomplete="off" data-i18n-ph="jb_note_ph" placeholder="NOTA (FACOLTATIVA)">
+          <button type="button" id="jukebox-add" class="jukebox-add" data-i18n="jb_add">PROPONI UNA TRACCIA</button>
+          <input type="file" id="jukebox-file" accept=".mp3,.wav,.ogg,.m4a,.flac,audio/*" hidden>
+        </div>
+        <span class="dim" id="sat-jukebox-empty" data-i18n="jb_sat_empty"></span>
+        <ul class="jukebox-list" id="sat-jukebox-list"></ul>
       </div>
 
       <div class="sliders">
@@ -336,6 +415,14 @@
     </section>
 
   </main>
+
+  <!-- LIGHT SHOW — full-screen synced light (satellites). Tap to reveal EXIT. -->
+  <div class="lightshow" id="lightshow" hidden>
+    <div class="lightshow-reveal" id="lightshow-reveal" hidden>
+      <span class="ls-name num" id="lightshow-pattern-name"></span>
+      <button type="button" id="lightshow-exit" data-i18n="ls_exit">ESCI DALLE LUCI</button>
+    </div>
+  </div>
 
   <!-- ARM OVERLAY -->
   <div class="arm-overlay" id="arm-overlay" hidden>

@@ -537,6 +537,167 @@ main {
 
 .mix-queue-tools { display: flex; flex-direction: column; gap: 0.9rem; }
 
+/* ------------------------------------------------------------- LIGHT SHOW
+   The full-screen light breaks the monochrome rule on purpose: it IS the
+   light, not the interface. The controls stay in the app's grammar. */
+.lightshow {
+  position: fixed;
+  inset: 0;
+  z-index: 8;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.lightshow-reveal {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.1rem;
+  background: rgba(0, 0, 0, 0.62);
+  padding: 1.6rem 1.8rem;
+}
+.lightshow-reveal .ls-name {
+  color: #fff;
+  letter-spacing: 0.25em;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+}
+#lightshow-exit {
+  background: #fff;
+  color: #000;
+  border: none;
+  padding: 1rem 1.6rem;
+  letter-spacing: 0.2em;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  cursor: pointer;
+  min-height: 48px;
+}
+
+.ls-block { display: flex; flex-direction: column; gap: 0.6rem; }
+.ls-toggle-row { display: flex; align-items: stretch; gap: 0.6rem; }
+.lights-toggle {
+  flex: 1;
+  min-height: 48px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: background 80ms linear, color 80ms linear;
+}
+.lights-toggle:hover { background: var(--white); color: #000; }
+.lights-toggle.on { background: var(--white); color: #000; border-color: var(--white); font-weight: 700; }
+.ls-preview { flex: none; width: 48px; border: 1px solid var(--border); background: #000; }
+.lightshow-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  border: 1px solid var(--border);
+  padding: 0.8rem;
+}
+.ls-seg button { font-size: 0.6rem; letter-spacing: 0.04em; padding: 0 0.15rem; }
+
+/* ---------------------------------------------------------------- JUKEBOX */
+.jukebox-panel { border: 1px solid var(--border); display: flex; flex-direction: column; }
+.jukebox-head {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  padding: 0.7rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+.jukebox-toggle {
+  flex: 1;
+  min-height: 44px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: background 80ms linear, color 80ms linear;
+}
+.jukebox-toggle:hover { background: var(--white); color: #000; }
+.jukebox-toggle.on { background: var(--white); color: #000; border-color: var(--white); font-weight: 700; }
+.jukebox-head .label { flex: none; }
+
+.jukebox-list { list-style: none; }
+.jb-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--surface);
+}
+.jb-row:last-child { border-bottom: none; }
+.jb-main { display: flex; flex-direction: column; gap: 0.2rem; min-width: 0; }
+.jb-name {
+  color: var(--white);
+  font-size: 0.74rem;
+  letter-spacing: 0.06em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.jb-by {
+  color: var(--disabled);
+  font-size: 0.6rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.jb-actions { display: flex; gap: 0.4rem; }
+.jb-actions button {
+  flex: 1;
+  min-height: 40px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text2);
+  font-size: 0.64rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 80ms linear, color 80ms linear;
+}
+.jb-actions button:hover { background: var(--white); color: #000; }
+.jb-vote { flex: 0 0 auto !important; min-width: 3.4em; }
+.jb-vote.on { background: var(--white); color: #000; border-color: var(--white); font-weight: 700; }
+.jb-dismiss { flex: 0 0 auto !important; min-width: 3em; }
+
+.jukebox-compose { display: flex; flex-direction: column; gap: 0.6rem; padding: 0.8rem 1rem; }
+.jb-input {
+  min-height: 44px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  color: var(--white);
+  padding: 0 0.8rem;
+  font-size: 0.8rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.jb-input::placeholder { color: var(--disabled); }
+.jb-input:focus { border-color: var(--white); outline: none; }
+.jukebox-add {
+  min-height: 48px;
+  background: transparent;
+  border: 1px solid var(--text2);
+  color: var(--white);
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: background 80ms linear, color 80ms linear;
+}
+.jukebox-add:hover:not(:disabled) { background: var(--white); color: #000; }
+.jukebox-add:disabled { color: var(--disabled); border-color: var(--surface); cursor: default; }
+.sat-jukebox { border: 1px solid var(--border); }
+.sat-jukebox .queue-head { padding: 0.7rem 1rem; border-bottom: 1px solid var(--border); }
+#jukebox-empty, #sat-jukebox-empty { display: block; padding: 0.7rem 1rem; }
+
 .techline {
   font-size: 0.65rem;
   color: var(--disabled);

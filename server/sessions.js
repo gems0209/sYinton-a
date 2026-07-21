@@ -38,6 +38,28 @@ const newDeck = () => ({
   rateRamp: null,       // kept for shape-compatibility with the timeline math
 });
 
+// ---- LIGHT SHOW constants ---------------------------------------------------
+// The lead picks a "look"; every device renders it locally, its TIMING derived
+// from the already-synchronized playback timeline (beat grid) or the analyser
+// level — the server never streams "flash" events.
+const LIGHTSHOW_PATTERNS = ['pulse', 'colorbeat', 'wave', 'breathe', 'strobe'];
+const LIGHTSHOW_PALETTES = ['spectrum', 'mono', 'warm', 'cool'];
+const LIGHTSHOW_SOURCES = ['auto', 'beat', 'level'];
+const LIGHTSHOW_DIVS = ['bar', 'beat', 'half', 'quarter'];
+const newLightshow = () => ({
+  on: false,
+  pattern: 'pulse',
+  palette: 'spectrum',
+  source: 'auto',
+  beatDiv: 'beat',
+  intensity: 1,      // 0..1 brightness of the pulse over the floor
+  floor: 0.12,       // 0..1 base brightness between pulses (never full black)
+});
+
+// ---- JUKEBOX constants ------------------------------------------------------
+const JUKEBOX_MAX_PER_DEVICE = 3;   // pending proposals a single device may hold
+const JUKEBOX_MAX_TOTAL = 20;       // pending proposals across the whole session
+
 const UPLOAD_ROOT = path.join(__dirname, '..', 'uploads');
 
 const sessions = new Map(); // code -> session
@@ -85,6 +107,16 @@ function create(leadClientId) {
     // decks.on the queue transport and auto-advance are suspended (the queue
     // itself stays intact and resumes, stopped, when decks are turned off).
     decks: { on: false, xfader: 0, A: newDeck(), B: newDeck() },
+    // ---- participatory layer (Light Show + Jukebox) ------------------------
+    // Stable per-device index (join order), used by the light show's spatial
+    // patterns and as a name fallback. Not recycled — monotonic per session.
+    nextDeviceIndex: 0,
+    // Lead-controlled "look"; rendered by every device off the shared clock.
+    lightshow: newLightshow(),
+    // Crowd requests: satellites upload tracks into a separate pool, the lead
+    // approves them into the queue. proposals: [{ id, filePath, name, note,
+    // byId, byIndex, size, votes:Set<clientId>, createdAt }].
+    jukebox: { open: false, proposals: [] },
     advanceWaitSince: null, // set while waiting for clients to buffer the next track
     orphanTimer: null,
     lastActivity: Date.now(),
@@ -312,6 +344,8 @@ function peerList(session) {
   return [...session.clients.values()].map((c) => ({
     id: c.id,
     role: c.role,
+    deviceIndex: c.deviceIndex ?? 0, // stable join-order index (light show / name fallback)
+    name: c.name || '',              // optional nickname (jukebox attribution)
     // "ready" is relative to the track PLAY would start right now.
     ready: gate ? c.readyFor.has(gate) : false,
     connected: c.connected,
@@ -337,6 +371,49 @@ function broadcastPeers(session) {
 
 function broadcastQueue(session) {
   broadcast(session, { type: 'queue-update', ...queueSnapshot(session) });
+}
+
+// ---- JUKEBOX ----------------------------------------------------------------
+// Public view of the request pool: names resolved live from the client records
+// (so a nickname change updates every proposal), ranked votes-desc then oldest.
+// `voterIds` lets each recipient tell whether IT already voted, without the
+// server tailoring the payload per client.
+function jukeboxSnapshot(session) {
+  const j = session.jukebox;
+  const proposals = j.proposals.map((p) => {
+    const c = session.clients.get(p.byId);
+    const byName = (c && c.name) || `OSPITE ${(p.byIndex ?? 0) + 1}`;
+    const voterIds = [...p.votes];
+    return { id: p.id, name: p.name, note: p.note, byName, votes: voterIds.length, voterIds };
+  });
+  proposals.sort((a, b) => b.votes - a.votes); // stable → ties stay in arrival order
+  return { open: j.open, proposals };
+}
+
+function broadcastJukebox(session) {
+  broadcast(session, { type: 'jukebox-update', jukebox: jukeboxSnapshot(session) });
+}
+
+// Insert an approved proposal into the live queue as a first-class track:
+// 'end' appends (shuffle: fair random spot in the unplayed tail, like upload),
+// 'next' drops it right after the current track (and after it in the shuffle
+// permutation). The playing track is referenced by id, so this never disturbs
+// what's currently playing.
+function insertTrack(session, track, mode = 'end') {
+  const curIdx = session.queue.findIndex((t) => t.id === session.currentTrackId);
+  if (mode === 'next' && curIdx >= 0) session.queue.splice(curIdx + 1, 0, track);
+  else session.queue.push(track);
+  if (session.shuffle) {
+    const order = session.shuffleOrder;
+    const cur = order.indexOf(session.currentTrackId);
+    if (mode === 'next' && cur >= 0) {
+      order.splice(cur + 1, 0, track.id);
+    } else {
+      const from = cur + 1;
+      const at = from + Math.floor(Math.random() * (order.length - from + 1));
+      order.splice(at, 0, track.id);
+    }
+  }
 }
 
 function deleteTrackFile(track) {
@@ -386,6 +463,9 @@ module.exports = {
   broadcast,
   broadcastPeers,
   broadcastQueue,
+  jukeboxSnapshot,
+  broadcastJukebox,
+  insertTrack,
   deleteTrackFile,
   destroy,
   cleanupStale,
@@ -404,4 +484,11 @@ module.exports = {
   DECK_IDS,
   DECK_PLAY_LEAD_MS,
   newDeck,
+  LIGHTSHOW_PATTERNS,
+  LIGHTSHOW_PALETTES,
+  LIGHTSHOW_SOURCES,
+  LIGHTSHOW_DIVS,
+  newLightshow,
+  JUKEBOX_MAX_PER_DEVICE,
+  JUKEBOX_MAX_TOTAL,
 };

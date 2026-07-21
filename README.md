@@ -1,6 +1,6 @@
 # sYntonia
 
-Turn a group of smartphones into one distributed sound system: a **lead** device uploads tracks into a queue, the others join with a 4-char code (or the shared session URL) and every speaker plays them in tight sync — auto-advancing through the playlist with repeat, shuffle and DJ-style **MIX MODE** transitions (BPM analysis, beatmatched crossfades, live EQ/filter/tempo), plus a manual **DUAL DECK** mode (two simultaneous timelines, crossfader, per-deck pitch and SYNC).
+Turn a group of smartphones into one distributed sound system: a **lead** device uploads tracks into a queue, the others join with a 4-char code (or the shared session URL) and every speaker plays them in tight sync — auto-advancing through the playlist with repeat, shuffle and DJ-style **MIX MODE** transitions (BPM analysis, beatmatched crossfades, live EQ/filter/tempo), plus a manual **DUAL DECK** mode (two simultaneous timelines, crossfader, per-deck pitch and SYNC). On top of the music sits a **participatory layer**: a synchronized **light show** that turns every screen into one light in time with the beat, and a **jukebox** where the crowd proposes tracks and the lead approves them into the queue.
 
 Node + Express + `ws` on the server, vanilla ES modules + Web Audio API on the client. No database, no build step, no frameworks. UI in Italian (EN switch in the header).
 
@@ -120,6 +120,52 @@ involved at all.
   live updates, late join and self-heal. Heartbeats carry both timelines and
   drift is corrected per channel.
 
+## Light show (every device)
+
+The lead picks a **look**; every screen — lead and satellites — becomes one
+light, and they pulse **together** because the timing is a purely *local*
+function of the already-synchronized playback timeline. The server never
+streams "flash" events: it only broadcasts the look (`lightshow-update`). Each
+client computes the beat locally from the current track's grid (or the
+analyser level), so the pulses land on the beat on every phone within the same
+tolerance as the audio itself, at zero extra protocol cost. Rendering is a
+single full-screen element whose colour is rewritten each frame — no canvas,
+no per-pixel work — so phones stay cool.
+
+- **Sources.** `beat` (the playing track's BPM grid — follows tempo and rate
+  glides automatically), `level` (the shared analyser's RMS — works with no
+  BPM and in DECKS mode), or `auto` (beat when a confident grid exists, else
+  level).
+- **Patterns.** `pulse` (all together), `colorbeat` (hue steps each beat),
+  `wave` (a colour sweep phased across devices by their join index), `breathe`
+  (ambient, no beat needed) and a gated `strobe`.
+- **Palette / intensity / base glow**, and a beat division (bar · beat · ½ · ¼).
+- **Safety.** The flash rate is capped (kept beat-aligned) so full-screen
+  flashing never exceeds ~3 Hz; `prefers-reduced-motion` softens it; a strobe
+  warning shows on first use. Satellites run full-screen and can **tap to
+  reveal a local EXIT** (it only affects that device); the lead keeps its
+  controls and watches a small preview swatch. A fresh OFF→ON re-includes
+  anyone who exited.
+
+## Jukebox (crowd requests, the lead curates)
+
+Zero audio-path changes — only protocol + UI. The lead **opens requests**;
+satellites then **propose a track** (an upload parked in a separate pool, not
+the queue) with an optional note and nickname, and everyone **upvotes**. The
+lead sees the list ranked by votes and **approves** a proposal into the queue
+(at the end, or **next**) or **dismisses** it (which deletes the file).
+
+- **Proposing** reuses the normal upload path with a `proposal` flag; it is
+  gated on an open jukebox and on quotas (**3 pending per device**, **20
+  total**). Approving turns the file into a first-class queue track — the
+  lead's BPM analysis picks it up like any other.
+- **Attribution.** Every device carries a stable join-order `deviceIndex` (used
+  by the light show's spatial patterns) and an optional **nickname**; proposer
+  names resolve live, so changing your nickname updates your requests.
+- **One reconciler.** Every change (open/close, propose, vote, approve,
+  dismiss) is answered with a single `jukebox-update` snapshot; late joiners
+  get the pool (and the light-show look) in their `joined` message.
+
 ## WebSocket protocol
 
 All session messages carry `sessionCode`; transport messages from satellites are ignored; malformed JSON never crashes the server.
@@ -127,9 +173,9 @@ All session messages carry `sessionCode`; transport messages from satellites are
 | Type | Dir | Payload |
 |---|---|---|
 | `create` / `created` | C→S / S→C | `clientId` ⇄ `sessionCode` |
-| `join` / `joined` | C→S / S→C | code+id ⇄ role, track, playback snapshot, peers |
+| `join` / `joined` | C→S / S→C | code+id ⇄ role, `deviceIndex`, snapshots (queue, playback, peers, `lightshow`, `jukebox`) |
 | `error` | S→C | `code`, `text` |
-| `peer-update` | S→C | count + `{id, role, ready, connected}` list |
+| `peer-update` | S→C | count + `{id, role, deviceIndex, name, ready, connected}` list |
 | `queue-update` | S→C | full queue (with `meta`, `cues`) + `currentTrackId`, `nextTrackId`, `repeatMode`, `shuffle`, `order`, `prefetch`, `transitionMode`, `tempo`, `fx` |
 | `track-change` | S→C | `trackId`, `startAtServerTime`, `trackOffset`, `rate`, `rateRamp`, `transition` (play, seek, skip, auto-advance) |
 | `client-ready` | C→S | `trackId` + decoded `duration` (per prefetched track) |
@@ -147,6 +193,13 @@ All session messages carry `sessionCode`; transport messages from satellites are
 | `deck-rate` / `deck-sync` | C→S | per-deck pitch 0.92–1.08 / BPM+phase match onto the other deck |
 | `xfader` / `xfader-update` | C→S / S→C | `x: −1..1` ⇄ same + `applyAtServerTime` |
 | `decks-update` | S→C | full decks snapshot (+ `glide` hint on pitch-only changes) |
+| `set-nickname` | C→S | optional display name (any role), sanitized + capped |
+| `lightshow-set` / `lightshow-update` | C→S / S→C | lead sets `{on, pattern, palette, source, beatDiv, intensity, floor}` ⇄ same to all |
+| `jukebox-set` | C→S | lead opens/closes the request pool (`open`) |
+| *(propose)* | C→S | HTTP `POST /upload/:code` with `proposal=1`, `clientId`, `note` |
+| `vote-proposal` | C→S | toggle this device's vote on `proposalId` (any role) |
+| `approve-proposal` / `dismiss-proposal` | C→S | lead: `proposalId` (+ `mode: end\|next`) → queue / delete |
+| `jukebox-update` | S→C | `{open, proposals:[{id, name, note, byName, votes, voterIds}]}` |
 | `click-start` / `click-stop` | C→S | calibration click track (refused in DECKS mode) |
 | `position-heartbeat` | S→C | `serverTime`, `trackPosition`, `rate`, `rampActive`, `decks{A,B}` (5 s) |
 | `position-request` | C→S | immediate heartbeat (after foregrounding) |

@@ -90,8 +90,48 @@ app.post('/upload/:sessionCode', upload.single('audio'), (req, res) => {
     return res.status(400).json({ error: 'NOT AN AUDIO FILE' });
   }
 
+  const fileId = path.basename(file.path, path.extname(file.path));
+
+  // Jukebox proposal: park the file in the request pool instead of the queue.
+  // Gated on an open jukebox and per-device / total quotas; the lead approves
+  // it into the queue later (or dismisses it, which deletes the file). The file
+  // is uploaded like any other; only its destination (pool vs queue) differs.
+  if (req.body && (req.body.proposal === '1' || req.body.proposal === 'true')) {
+    const j = session.jukebox;
+    const byId = typeof req.body.clientId === 'string' ? req.body.clientId : '';
+    if (!j.open) {
+      fs.unlink(file.path, () => {});
+      return res.status(403).json({ error: 'REQUESTS CLOSED' });
+    }
+    if (j.proposals.length >= S.JUKEBOX_MAX_TOTAL) {
+      fs.unlink(file.path, () => {});
+      return res.status(429).json({ error: 'TOO MANY REQUESTS' });
+    }
+    if (byId && j.proposals.filter((p) => p.byId === byId).length >= S.JUKEBOX_MAX_PER_DEVICE) {
+      fs.unlink(file.path, () => {});
+      return res.status(429).json({ error: 'YOUR REQUEST LIMIT REACHED' });
+    }
+    const client = session.clients.get(byId);
+    const note = (typeof req.body.note === 'string' ? req.body.note : '')
+      .replace(/\s+/g, ' ').trim().slice(0, 80); // one tidy line, capped
+    j.proposals.push({
+      id: fileId,
+      filePath: file.path,
+      name: file.originalname,
+      note,
+      byId,
+      byIndex: client ? client.deviceIndex : 0,
+      size: file.size,
+      votes: new Set(),
+      createdAt: Date.now(),
+    });
+    S.touch(session);
+    S.broadcastJukebox(session);
+    return res.json({ ok: true, proposalId: fileId });
+  }
+
   const track = {
-    id: path.basename(file.path, path.extname(file.path)),
+    id: fileId,
     filePath: file.path,
     originalName: file.originalname,
     size: file.size,
@@ -296,6 +336,8 @@ function attachClient(session, clientId, role, ws) {
   }
   const client = {
     id: clientId, role, ws, readyFor: new Set(), connected: true, disconnectedAt: null, removeTimer: null,
+    deviceIndex: session.nextDeviceIndex++, // stable join-order index (light show / jukebox)
+    name: '',                               // optional nickname
   };
   session.clients.set(clientId, client);
   return client;
@@ -362,9 +404,12 @@ const HANDLERS = {
       sessionCode: session.code,
       clientId: msg.clientId,
       role: isLead ? 'lead' : 'satellite',
+      deviceIndex: session.clients.get(msg.clientId).deviceIndex, // this device's own index
       queue: S.queueSnapshot(session),
       playback: S.playbackSnapshot(session),
       peers: S.peerList(session),
+      lightshow: session.lightshow,               // late join picks up the current look
+      jukebox: S.jukeboxSnapshot(session),        // …and the current request pool
     });
     S.broadcastPeers(session);
   },
@@ -797,6 +842,87 @@ const HANDLERS = {
     });
   },
 
+  // ---- participatory layer: identity + light show + jukebox --------------
+  // Optional nickname (any role): shown in the device list and used as the
+  // jukebox proposer name. One tidy line, capped.
+  'set-nickname'(ws, msg, session, client) {
+    client.name = (typeof msg.name === 'string' ? msg.name : '')
+      .replace(/\s+/g, ' ').trim().slice(0, 16);
+    S.broadcastPeers(session);
+    if (session.jukebox.proposals.length) S.broadcastJukebox(session); // proposer names update live
+  },
+
+  // Light show: the lead sets the "look" (validated + clamped); every device
+  // renders it LOCALLY off the shared timeline. The server never streams the
+  // per-beat flash — only this state. Accepts a full or partial lightshow obj.
+  'lightshow-set'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    const l = session.lightshow;
+    const s = (msg.lightshow && typeof msg.lightshow === 'object') ? msg.lightshow : msg;
+    const pick = (v, allowed, dflt) => (allowed.includes(v) ? v : dflt);
+    const num = (v, min, max, dflt) => (typeof v === 'number' && isFinite(v) ? Math.min(max, Math.max(min, v)) : dflt);
+    session.lightshow = {
+      on: 'on' in s ? !!s.on : l.on,
+      pattern: pick(s.pattern, S.LIGHTSHOW_PATTERNS, l.pattern),
+      palette: pick(s.palette, S.LIGHTSHOW_PALETTES, l.palette),
+      source: pick(s.source, S.LIGHTSHOW_SOURCES, l.source),
+      beatDiv: pick(s.beatDiv, S.LIGHTSHOW_DIVS, l.beatDiv),
+      intensity: num(s.intensity, 0, 1, l.intensity),
+      floor: num(s.floor, 0, 0.6, l.floor),
+    };
+    S.broadcast(session, { type: 'lightshow-update', lightshow: session.lightshow });
+  },
+
+  // Jukebox: open/close the request pool (lead). Proposing is an HTTP upload
+  // with the `proposal` flag (see /upload); these WS messages cover the rest.
+  'jukebox-set'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    session.jukebox.open = !!msg.open;
+    S.broadcastJukebox(session);
+  },
+
+  // One vote per device per proposal (toggle). Any role — the crowd ranks.
+  'vote-proposal'(ws, msg, session, client) {
+    const p = session.jukebox.proposals.find((x) => x.id === msg.proposalId);
+    if (!p) return;
+    if (p.votes.has(client.id)) p.votes.delete(client.id);
+    else p.votes.add(client.id);
+    S.broadcastJukebox(session);
+  },
+
+  // Approve a proposal into the queue (lead): it becomes a first-class track,
+  // 'end' (default) or 'next'. The lead's analysis picks up its BPM as usual.
+  'approve-proposal'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    const idx = session.jukebox.proposals.findIndex((x) => x.id === msg.proposalId);
+    if (idx < 0) return;
+    const [p] = session.jukebox.proposals.splice(idx, 1);
+    S.insertTrack(session, {
+      id: p.id,
+      filePath: p.filePath,
+      originalName: p.name,
+      size: p.size,
+      duration: null,
+      meta: null,
+      cues: [null, null, null, null],
+      addedAt: Date.now(),
+    }, msg.mode === 'next' ? 'next' : 'end');
+    S.touch(session);
+    S.broadcastQueue(session);
+    S.broadcastPeers(session);
+    S.broadcastJukebox(session);
+  },
+
+  // Dismiss a proposal (lead): drop it from the pool and delete its file.
+  'dismiss-proposal'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    const idx = session.jukebox.proposals.findIndex((x) => x.id === msg.proposalId);
+    if (idx < 0) return;
+    const [p] = session.jukebox.proposals.splice(idx, 1);
+    fs.unlink(p.filePath, () => {});
+    S.broadcastJukebox(session);
+  },
+
   // Calibration click track — generated locally by every client, scheduled
   // like a normal track; the queue is untouched.
   'click-start'(ws, msg, session, client) {
@@ -844,6 +970,8 @@ const SESSION_SCOPED = new Set([
   'skip-next', 'skip-prev', 'queue-remove', 'queue-reorder', 'set-repeat', 'set-shuffle',
   'track-meta', 'set-transition', 'set-tempo', 'fx-set', 'cue-set',
   'decks-mode', 'deck-load', 'deck-play', 'deck-pause', 'deck-seek', 'deck-rate', 'deck-sync', 'xfader',
+  'set-nickname', 'lightshow-set',
+  'jukebox-set', 'vote-proposal', 'approve-proposal', 'dismiss-proposal',
   'click-start', 'click-stop', 'position-request', 'leave',
 ]);
 

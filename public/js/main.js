@@ -5,6 +5,8 @@ import { SyncPlayer } from './player.js';
 import { createField } from './wavefield.js';
 import { loadCalibration, saveCalibration } from './calibration.js';
 import { t, apply as applyI18n, setLang, onLangChange } from './i18n.js';
+import * as lightshow from './lightshow.js';
+import * as jukebox from './jukebox.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -43,6 +45,8 @@ const S = {
   tempo: 1,              // MIX: master tempo (0.92..1.08)
   fx: null,              // MIX: live EQ/filter state (server-owned)
   decks: null,           // DUAL DECK snapshot {on, xfader, A, B} (server-owned)
+  jukebox: null,         // JUKEBOX snapshot {open, proposals} (server-owned)
+  deviceIndex: 0,        // this device's stable index (light show / attribution)
   playback: { status: 'idle' },
   peers: [],
   wakeLock: null,
@@ -90,6 +94,8 @@ function showView(name) {
     S.role = null;
     S.code = null;
     S.decks = null;
+    S.jukebox = null;
+    lightshow.hide(); // stop painting + drop the full-screen overlay
     bufferCache.clear();
     safeRemove(sessionStorage, 'wavepool-session');
     if (location.pathname !== '/debug') history.replaceState(null, '', '/');
@@ -180,6 +186,12 @@ async function requestWakeLock() {
   }
 }
 
+// ---------------------------------------------- participatory layer setup ---
+// Light show + jukebox run on EVERY role (unlike dj.js): the lead drives them,
+// satellites render. Both are small and imported statically.
+lightshow.init({ S, ws, player, t, flash });
+jukebox.init({ S, ws, player, t, flash });
+
 // ------------------------------------------------------------------ i18n ---
 applyI18n();
 for (const btn of document.querySelectorAll('[data-lang]')) {
@@ -193,6 +205,8 @@ onLangChange(() => {
   $('btn-cal-lock').textContent = t($('cal').disabled ? 'cal_unlock' : 'cal_lock');
   $('net-status').textContent = ws.open ? t('connected') : t('reconnecting');
   if (dj) dj.onQueue(); // MIX labels re-render
+  lightshow.refresh();  // toggle/pattern labels
+  jukebox.render();     // jukebox labels
 });
 
 // ------------------------------------------------------------------ home ---
@@ -267,7 +281,11 @@ ws.on('created', (msg) => {
 });
 
 ws.on('joined', (msg) => {
+  if (typeof msg.deviceIndex === 'number') S.deviceIndex = msg.deviceIndex;
   enterSession(msg.sessionCode, msg.role, msg.queue, msg.playback, msg.peers);
+  // Late join / reconnect: adopt the current light-show look and request pool.
+  if (msg.lightshow) lightshow.set(msg.lightshow);
+  jukebox.apply(msg.jukebox || { open: false, proposals: [] });
 });
 
 ws.on('error', (msg) => {
@@ -288,6 +306,8 @@ ws.on('error', (msg) => {
 
 ws.on('peer-update', (msg) => {
   S.peers = msg.peers;
+  const me = msg.peers.find((p) => p.id === S.clientId);
+  if (me) S.deviceIndex = me.deviceIndex; // used by the light show's spatial patterns
   renderPeers();
 });
 
@@ -346,6 +366,12 @@ ws.on('fx-update', (msg) => {
   player.setFx(msg.fx, applyCtx);
   if (dj) dj.onFx();
 });
+
+// Light show: the lead set a new "look"; render it (timing stays local).
+ws.on('lightshow-update', (msg) => lightshow.set(msg.lightshow));
+
+// Jukebox: the request pool changed (open/close, new proposal, vote, approve).
+ws.on('jukebox-update', (msg) => jukebox.apply(msg.jukebox));
 
 // ------------------------------------------------------------- DUAL DECK --
 // One reconciler for everything deck-related: every decks-update (and the
@@ -571,6 +597,8 @@ function enterSession(code, role, queueSnapshot, playback, peers) {
   renderTrack();
   renderStatus();
   requestWakeLock();
+  jukebox.onEnter();   // re-assert saved nickname + render the request pool
+  lightshow.refresh(); // role is known now → correct overlay/controls
   // Late join into running playback: handled by ensureBuffers → ensurePlaying.
 }
 
@@ -725,8 +753,16 @@ function renderPeers() {
     const li = document.createElement('li');
     const who = p.role === 'lead' ? t('lead') : t('satellite');
     const me = p.id === S.clientId ? ` [${t('you')}]` : '';
+    // Nickname when set, else the short id. Built with textContent (user input).
+    const label = (p.name || p.id.slice(0, 4)).toUpperCase();
     const state = !p.connected ? '· · ·' : (p.ready ? t('st_ready') : (S.queue.length ? t('st_loading') : '—'));
-    li.innerHTML = `<span>${who} ${p.id.slice(0, 4).toUpperCase()}${me}</span><span class="${p.ready ? 'ready' : 'dim'}">${state}</span>`;
+    const left = document.createElement('span');
+    left.textContent = `${who} ${label}${me}`;
+    const right = document.createElement('span');
+    right.className = p.ready ? 'ready' : 'dim';
+    right.textContent = state;
+    li.appendChild(left);
+    li.appendChild(right);
     if (!p.connected) li.classList.add('dim');
     ul.appendChild(li);
   }
@@ -869,6 +905,7 @@ setInterval(() => {
     $('time-cur').textContent = fmtTime(pos);
   }
   if (dj) dj.tick();
+  lightshow.tick(); // repaint fallback (throttled/backgrounded webviews)
   renderTech();
 }, 250);
 

@@ -458,6 +458,8 @@ function renderDecks() {
   if (on) {
     renderStrip('A');
     renderStrip('B');
+    const bm = $('btn-beatmatch');
+    if (bm) bm.disabled = !(deckTrackObj('A') && deckTrackObj('B'));
     const xf = $('xfader');
     if (document.activeElement !== xf && !xfPending) {
       xf.value = String(Math.round((E.S.decks.xfader || 0) * 100));
@@ -582,6 +584,19 @@ function wireStrip(id) {
 function wireDecks() {
   $('btn-decks').addEventListener('click', () => {
     send({ type: 'decks-mode', on: !(E.S.decks && E.S.decks.on) });
+  });
+  // One-tap beatmatch: match both decks' BPM, phase-lock, play them together
+  // and centre the crossfader. Pre-flight the two common failures in the user's
+  // language so the button never feels dead; the server has the final say.
+  const bm = $('btn-beatmatch');
+  if (bm) bm.addEventListener('click', () => {
+    const a = deckTrackObj('A');
+    const b = deckTrackObj('B');
+    if (!a || !b) return E.flash(t('bm_need_both'));
+    const hasBpm = (tr) => tr.meta && tr.meta.bpm;
+    if (!hasBpm(a) || !hasBpm(b)) return E.flash(t('bm_need_bpm'));
+    send({ type: 'deck-beatmatch' });
+    E.flash(t('bm_done'));
   });
   wireStrip('A');
   wireStrip('B');

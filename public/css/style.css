@@ -159,6 +159,39 @@ main {
 }
 .help-body p.dim { margin-top: 0.4rem; color: var(--disabled); }
 
+/* ---------------------------------------------- inline "?" help + headings
+   A compact, tap-friendly explainer next to each section title. Collapsed by
+   default so the lead view stays clean; the detail is one tap away. */
+.section-head { display: flex; align-items: center; gap: 0.6rem; }
+.section-head > :first-child { flex: 1; min-width: 0; }
+.qmark {
+  flex: none;
+  width: 1.5rem; height: 1.5rem;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text2);
+  font-size: 0.72rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 80ms linear, color 80ms linear;
+}
+.qmark:hover { background: var(--white); color: #000; }
+.qmark.on { background: var(--white); color: #000; border-color: var(--white); font-weight: 700; }
+.qhelp {
+  border-left: 2px solid var(--text2);
+  background: var(--bg2);
+  padding: 0.6rem 0.8rem;
+  font-size: 0.66rem;
+  line-height: 1.85;
+  letter-spacing: 0.08em;
+  color: var(--text2);
+  text-transform: uppercase;
+}
+/* queue-head becomes a header row so its "?" sits at the right edge */
+.queue-head { display: flex; align-items: center; justify-content: space-between; gap: 0.6rem; }
+.jukebox-head .qmark { flex: none; }
+
 /* ------------------------------------------------------------------ home */
 .home-blocks { display: flex; flex-direction: column; }
 
@@ -340,6 +373,10 @@ main {
 }
 .queue-row:last-child { border-bottom: none; }
 .queue-row.active { background: var(--text); color: #000; } /* inversion, not color */
+/* Tap a (non-playing) row to jump to that track — lead, queue mode. */
+.queue-row.q-clickable { cursor: pointer; }
+.queue-row.q-clickable:hover { background: var(--surface); color: var(--white); }
+.queue-row.q-clickable:hover .q-name { text-decoration: underline; text-underline-offset: 3px; }
 .q-mark { width: 1em; flex: none; }
 .q-num { color: var(--disabled); flex: none; }
 .queue-row.active .q-num { color: #000; }
@@ -456,6 +493,23 @@ main {
 .decks-toggle.on { background: var(--white); color: #000; border-color: var(--white); font-weight: 700; }
 
 .decks-panel { display: flex; flex-direction: column; gap: 0.9rem; }
+
+/* One-tap beatmatch: the headline action of the deck panel. */
+.beatmatch-btn {
+  width: 100%;
+  min-height: 52px;
+  background: transparent;
+  border: 1px solid var(--text2);
+  color: var(--white);
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 80ms linear, color 80ms linear;
+}
+.beatmatch-btn:hover:not(:disabled) { background: var(--white); color: #000; }
+.beatmatch-btn:disabled { color: var(--disabled); border-color: var(--surface); cursor: default; font-weight: 400; }
 
 .deck-strip {
   border: 1px solid var(--border);

@@ -1,6 +1,6 @@
 # sYntonia
 
-Turn a group of smartphones into one distributed sound system: a **lead** device uploads tracks into a queue, the others join with a 4-char code (or the shared session URL) and every speaker plays them in tight sync — auto-advancing through the playlist with repeat, shuffle and DJ-style **MIX MODE** transitions (BPM analysis, beatmatched crossfades, live EQ/filter/tempo), plus a manual **DUAL DECK** mode (two simultaneous timelines, crossfader, per-deck pitch and SYNC). On top of the music sits a **participatory layer**: a synchronized **light show** that turns every screen into one light in time with the beat, and a **jukebox** where the crowd proposes tracks and the lead approves them into the queue.
+Turn a group of smartphones into one distributed sound system: a **lead** device uploads tracks into a queue, the others join with a 4-char code (or the shared session URL) and every speaker plays them in tight sync — auto-advancing through the playlist with repeat, shuffle and DJ-style **MIX MODE** transitions (BPM analysis, beatmatched crossfades, live EQ/filter/tempo), plus a manual **DUAL DECK** mode (two simultaneous timelines, crossfader, per-deck pitch and one-tap **SYNC & PLAY** beatmatch). On top of the music sits a **participatory layer**: a synchronized **light show** that turns every screen into one light in time with the beat, and a **jukebox** where the crowd proposes tracks and the lead approves them into the queue. Every section in the lead view carries an inline **?** explainer, and tapping any queue row plays that track.
 
 Node + Express + `ws` on the server, vanilla ES modules + Web Audio API on the client. No database, no build step, no frameworks. UI in Italian (EN switch in the header).
 
@@ -46,6 +46,10 @@ points:
 - The playing track is referenced **by id, not index**: removing or reordering
   rows can never shift playback. Removing the playing track skips to its
   successor (or stops at the end of the queue with repeat off).
+- **Tap a row to play it** (`queue-jump`, lead only). Like a manual skip, it
+  honours the active transition (a hard cut in CUT mode, otherwise the fade /
+  beatmatch starts now); tapping the live track is a no-op. In DECKS mode a row
+  loads a deck instead, so the tap-to-jump is disabled there.
 
 ## MIX MODE (lead-only DJ tools)
 
@@ -109,6 +113,13 @@ involved at all.
   so the effective BPMs match (octave folding, refused with a soft error
   outside the pitch range) and phase-aligns the beat grids with a
   nearest-beat micro-seek (≤ half a beat, rendered as a 60 ms crossfade).
+- **SYNC & PLAY** (`deck-beatmatch`): one tap does the whole beatmatch — picks
+  a master (a deck already playing, else A), matches the other deck's BPM,
+  phase-locks it, **starts whatever isn't playing** and centres the crossfader
+  so both are audible. A stopped follower is brought in fresh on the master's
+  beat from its own downbeat; a playing one is micro-seeked into phase. It's the
+  "put both at the same BPM and play them together" button; the per-deck SYNC
+  above stays for hands-on control.
 - **Crossfader**: −1 = only A, +1 = only B, cos/sin equal-power law, streamed
   like the fx (throttled, applied everywhere at a server-fixed instant ~0.3 s
   ahead; double-tap recenters). The global EQ/filter sits after the mix and
@@ -208,6 +219,7 @@ All session messages carry `sessionCode`; transport messages from satellites are
 | `client-ready` | C→S | `trackId` + decoded `duration` (per prefetched track) |
 | `play` / `pause` / `stop` / `seek` | C→S | lead transport (server re-emits `track-change` / `pause` / `stop`) |
 | `skip-next` / `skip-prev` | C→S | prev restarts the track when >3 s in |
+| `queue-jump` | C→S | tap a row to play `trackId` now (honours the transition; no-op on the live track) |
 | `queue-remove` / `queue-reorder` | C→S | `trackId` / `from`,`to` |
 | `set-repeat` / `set-shuffle` | C→S | `mode: off\|all\|one` / `on: bool` |
 | `track-meta` | C→S | lead analysis: `trackId`, `bpm`, `confidence`, `beatPhase`, `gainDb` |
@@ -218,6 +230,7 @@ All session messages carry `sessionCode`; transport messages from satellites are
 | `decks-mode` | C→S | `on: bool` (on adopts a playing queue track as deck A) |
 | `deck-load` / `deck-play` / `deck-pause` / `deck-seek` | C→S | `deck: A\|B` + `trackId` / `position` / `force` |
 | `deck-rate` / `deck-sync` | C→S | per-deck pitch 0.92–1.08 / BPM+phase match onto the other deck |
+| `deck-beatmatch` | C→S | one-tap: match BPM, phase-lock, start both decks, centre the crossfader |
 | `xfader` / `xfader-update` | C→S / S→C | `x: −1..1` ⇄ same + `applyAtServerTime` |
 | `decks-update` | S→C | full decks snapshot (+ `glide` hint on pitch-only changes) |
 | `set-nickname` | C→S | optional display name (any role), sanitized + capped |

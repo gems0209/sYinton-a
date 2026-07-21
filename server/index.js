@@ -513,6 +513,25 @@ const HANDLERS = {
     if (prev) startTrack(session, prev);
   },
 
+  // Tap a queue row to make THAT track play now. Like a manual skip: if we're
+  // already playing and the transition isn't a hard cut, the active transition
+  // rides (djay-style, fade/beatmatch starts now); otherwise it's a clean jump.
+  // Not gated on client readiness (same as skip) — decoders self-heal.
+  'queue-jump'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    if (session.decks.on) return; // in DECKS mode a row loads a deck, not the queue
+    const track = S.getTrack(session, msg.trackId);
+    if (!track) return;
+    if (track.id === session.currentTrackId
+      && session.playback.status === 'playing' && !session.playback.click) return; // no-op on the live track
+    const playing = session.playback.status === 'playing' && !session.playback.click;
+    if (playing && session.transitionMode !== 'cut') {
+      startTransition(session, track.id, { manual: true });
+    } else {
+      startTrack(session, track.id);
+    }
+  },
+
   'queue-remove'(ws, msg, session, client) {
     if (client.role !== 'lead') return;
     const track = S.getTrack(session, msg.trackId);
@@ -833,6 +852,84 @@ const HANDLERS = {
     S.broadcastDecks(session); // no glide: the micro-seek is a reschedule
   },
 
+  // One-tap beatmatch: "put both decks at the same BPM and play them together".
+  // Picks a master (a deck already playing, else A), matches the other deck's
+  // BPM, phase-locks it, starts whatever isn't playing and centers the
+  // crossfader so both are audible. Reuses deck-sync's phase math; a follower
+  // that's already playing is micro-seeked into phase, a stopped one is brought
+  // in fresh on the master's beat from its own downbeat.
+  'deck-beatmatch'(ws, msg, session, client) {
+    if (client.role !== 'lead') return;
+    if (!session.decks.on) return;
+    const A = session.decks.A;
+    const B = session.decks.B;
+    if (!A.trackId || !B.trackId) return sendError(ws, 'SYNC_UNAVAILABLE', 'LOAD BOTH DECKS');
+    const tA = S.getTrack(session, A.trackId);
+    const tB = S.getTrack(session, B.trackId);
+    const mA = tA && tA.meta;
+    const mB = tB && tB.meta;
+    if (!mA || !mB || !mA.bpm || !mB.bpm || mA.confidence < 0.2 || mB.confidence < 0.2) {
+      return sendError(ws, 'SYNC_UNAVAILABLE', 'BPM NOT READY');
+    }
+    // Master = a deck already playing (prefer A); follower = the other one.
+    const masterId = A.status === 'playing' ? 'A' : (B.status === 'playing' ? 'B' : 'A');
+    const followId = masterId === 'A' ? 'B' : 'A';
+    const master = deckOf(session, masterId);
+    const follow = deckOf(session, followId);
+    const mMaster = masterId === 'A' ? mA : mB;
+    const mFollow = followId === 'A' ? mA : mB;
+    const tFollow = followId === 'A' ? tA : tB;
+
+    // Start the master if it isn't playing yet.
+    if (master.status !== 'playing') {
+      master.trackOffset = master.pausedPosition || 0;
+      master.startAtServerTime = now() + S.DECK_PLAY_LEAD_MS;
+      master.pausedPosition = 0;
+      master.status = 'playing';
+    }
+
+    // Follower rate = octave-folded ratio matching the master's effective BPM.
+    let ratio = (mMaster.bpm * master.rate) / mFollow.bpm;
+    while (ratio > 1.5) ratio /= 2;
+    while (ratio < 1 / 1.5) ratio *= 2;
+    if (ratio < S.TEMPO_MIN || ratio > S.TEMPO_MAX) {
+      return sendError(ws, 'SYNC_UNAVAILABLE', 'BPM OUT OF PITCH RANGE');
+    }
+
+    // The master's next beat instant (at or after a shared future apply time).
+    const applyAt = Math.max(now() + S.FX_APPLY_LEAD_MS, master.startAtServerTime);
+    const posM = S.timelinePositionAt(master, applyAt);
+    const bM = 60 / mMaster.bpm;
+    const kM = Math.ceil((posM - (mMaster.beatPhase || 0)) / bM - 1e-6);
+    const tBeat = applyAt + (((mMaster.beatPhase || 0) + kM * bM - posM) / master.rate) * 1000;
+
+    follow.rate = ratio;
+    if (follow.status === 'playing') {
+      // Already playing: nearest-beat micro-seek at its current position.
+      const posF = S.timelinePositionAt(follow, applyAt);
+      const posFAtBeat = posF + ((tBeat - applyAt) / 1000) * ratio;
+      const bF = 60 / mFollow.bpm;
+      const mBeat = Math.round((posFAtBeat - (mFollow.beatPhase || 0)) / bF);
+      let from = posF + (((mFollow.beatPhase || 0) + mBeat * bF) - posFAtBeat);
+      if (from < 0) from += bF;
+      if (tFollow.duration && from > tFollow.duration - 0.1) from = mFollow.beatPhase || 0;
+      follow.trackOffset = from;
+      follow.startAtServerTime = applyAt;
+    } else {
+      // Bring it in fresh: start on the master's beat from its own downbeat.
+      let from = mFollow.beatPhase || 0;
+      if (tFollow.duration && from >= tFollow.duration) from = 0;
+      follow.trackOffset = from;
+      follow.startAtServerTime = tBeat;
+      follow.pausedPosition = 0;
+      follow.status = 'playing';
+    }
+
+    session.decks.xfader = 0; // center: both decks audible
+    S.broadcastDecks(session);
+    S.broadcast(session, { type: 'xfader-update', x: 0, applyAtServerTime: now() + S.FX_APPLY_LEAD_MS });
+  },
+
   // Crossfader stream (throttled client-side like fx-set): −1 = only A,
   // +1 = only B, equal-power law rendered by every client.
   xfader(ws, msg, session, client) {
@@ -997,9 +1094,9 @@ const HANDLERS = {
 // Messages that only make sense inside a session.
 const SESSION_SCOPED = new Set([
   'client-ready', 'play', 'pause', 'stop', 'seek',
-  'skip-next', 'skip-prev', 'queue-remove', 'queue-reorder', 'set-repeat', 'set-shuffle',
+  'skip-next', 'skip-prev', 'queue-jump', 'queue-remove', 'queue-reorder', 'set-repeat', 'set-shuffle',
   'track-meta', 'set-transition', 'set-tempo', 'fx-set', 'cue-set',
-  'decks-mode', 'deck-load', 'deck-play', 'deck-pause', 'deck-seek', 'deck-rate', 'deck-sync', 'xfader',
+  'decks-mode', 'deck-load', 'deck-play', 'deck-pause', 'deck-seek', 'deck-rate', 'deck-sync', 'deck-beatmatch', 'xfader',
   'set-nickname', 'lightshow-set',
   'jukebox-set', 'vote-proposal', 'approve-proposal', 'dismiss-proposal',
   'multizone-set', 'zone-assign',

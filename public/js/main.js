@@ -215,6 +215,22 @@ onLangChange(() => {
   multizone.render();   // zone labels
 });
 
+// ------------------------------------------------------------ inline help ---
+// Every "?" chip reveals/hides the explanation it controls (aria-controls).
+// Collapsed by default so the lead view stays clean; detail is one tap away.
+for (const q of document.querySelectorAll('.qmark')) {
+  q.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const tip = document.getElementById(q.getAttribute('aria-controls'));
+    if (!tip) return;
+    const willOpen = tip.hidden;
+    tip.hidden = !willOpen;
+    q.classList.toggle('on', willOpen);
+    q.setAttribute('aria-expanded', String(willOpen));
+  });
+}
+
 // ------------------------------------------------------------------ home ---
 // First ever visit: the explainer starts open, then stays collapsed.
 if (!safeGet(localStorage, 'wavepool-seen')) {
@@ -307,6 +323,8 @@ ws.on('error', (msg) => {
     flash(t('err_not_ready'));
   } else if (msg.code === 'NO_TRACK') {
     flash(t('err_no_track'));
+  } else if (msg.code === 'SYNC_UNAVAILABLE') {
+    flash(t('err_sync'));
   } else if (msg.code !== 'NO_SESSION') {
     flash(`ERR: ${msg.text || msg.code}`);
   }
@@ -810,9 +828,24 @@ function renderQueue() {
         `<span class="q-state">${state}</span>` +
         (bpm ? `<span class="q-bpm num">${bpm}</span>` : '') +
         `<span class="q-dur num">${dur}</span>`;
+      const decksOn = !!(S.decks && S.decks.on);
+      // Tap a row to play that track now (lead, queue mode, not the live one).
+      if (isLead && !decksOn && track.id !== S.currentTrackId) {
+        li.classList.add('q-clickable');
+        li.setAttribute('role', 'button');
+        li.tabIndex = 0;
+        li.setAttribute('aria-label', `${t('play')} ${track.name}`);
+        const jump = () => ws.send({ type: 'queue-jump', sessionCode: S.code, trackId: track.id });
+        li.addEventListener('click', jump);
+        li.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); jump(); }
+        });
+      }
       if (isLead) {
         const controls = document.createElement('span');
         controls.className = 'q-controls';
+        // Row-level controls must not also trigger the jump-to-track click.
+        controls.addEventListener('click', (e) => e.stopPropagation());
         const mk = (label, aria, fn, disabled = false) => {
           const b = document.createElement('button');
           b.type = 'button';

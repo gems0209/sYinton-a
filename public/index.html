@@ -114,7 +114,11 @@
       <div class="time-line num"><span id="time-cur">00:00</span> / <span id="time-dur">00:00</span></div>
 
       <div class="queue-panel" id="queue-panel" hidden>
-        <div class="queue-head label"><span data-i18n="queue_title">CODA</span>: <span id="queue-count" class="num">00</span></div>
+        <div class="queue-head label">
+          <span><span data-i18n="queue_title">CODA</span>: <span id="queue-count" class="num">00</span></span>
+          <button type="button" class="qmark" aria-controls="qhelp-queue" aria-expanded="false" aria-label="?">?</button>
+        </div>
+        <div class="qhelp" id="qhelp-queue" hidden data-i18n="help_queue"></div>
         <ul class="queue-list" id="queue-list"></ul>
       </div>
 
@@ -128,13 +132,27 @@
           </summary>
           <div class="mix-body">
 
+            <div class="section-head">
+              <span class="dim" data-i18n="mix_help_label">COME FUNZIONA IL MIX</span>
+              <button type="button" class="qmark" aria-controls="qhelp-mix" aria-expanded="false" aria-label="?">?</button>
+            </div>
+            <div class="qhelp" id="qhelp-mix" hidden data-i18n="help_mix"></div>
+
             <!-- DUAL DECK: two timelines + crossfader; the queue pauses. -->
             <div class="mix-block">
+              <div class="section-head">
+                <span class="label" data-i18n="decks">DECKS</span>
+                <button type="button" class="qmark" aria-controls="qhelp-decks" aria-expanded="false" aria-label="?">?</button>
+              </div>
+              <div class="qhelp" id="qhelp-decks" hidden data-i18n="help_decks"></div>
               <button type="button" id="btn-decks" class="decks-toggle">DECKS: OFF</button>
               <span class="dim" data-i18n="decks_hint"></span>
             </div>
 
             <div id="decks-panel" class="decks-panel" hidden>
+              <button type="button" id="btn-beatmatch" class="beatmatch-btn" data-i18n="deck_beatmatch" disabled>SYNC &amp; SUONA</button>
+              <span class="dim" data-i18n="deck_beatmatch_hint"></span>
+
               <div class="deck-strip">
                 <div class="strip-head">
                   <span class="deck-tag">A</span>
@@ -207,7 +225,11 @@
             <span class="dim" data-i18n="mix_cue_hint"></span>
 
             <div class="mix-block">
-              <span class="label" data-i18n="mix_transition">TRANSIZIONE</span>
+              <div class="section-head">
+                <span class="label" data-i18n="mix_transition">TRANSIZIONE</span>
+                <button type="button" class="qmark" aria-controls="qhelp-tr" aria-expanded="false" aria-label="?">?</button>
+              </div>
+              <div class="qhelp" id="qhelp-tr" hidden data-i18n="help_transition"></div>
               <div class="seg">
                 <button type="button" id="tr-cut" class="on">CUT</button>
                 <button type="button" id="tr-fade2">2S</button>
@@ -217,17 +239,28 @@
               </div>
             </div>
 
-            <div class="slider-row">
-              <label class="label" for="tempo"><span data-i18n="mix_tempo">TEMPO</span> <span class="num" id="tempo-val">100.0%</span></label>
-              <div class="cal-row">
-                <button type="button" id="btn-tempo-reset" class="cal-lock">100</button>
-                <input type="range" id="tempo" min="92" max="108" value="100" step="0.5">
+            <div class="mix-block">
+              <div class="section-head">
+                <span class="label" data-i18n="mix_tempo">TEMPO</span>
+                <button type="button" class="qmark" aria-controls="qhelp-tempo" aria-expanded="false" aria-label="?">?</button>
+              </div>
+              <div class="qhelp" id="qhelp-tempo" hidden data-i18n="help_tempo"></div>
+              <div class="slider-row">
+                <label class="label" for="tempo"><span class="num" id="tempo-val">100.0%</span></label>
+                <div class="cal-row">
+                  <button type="button" id="btn-tempo-reset" class="cal-lock">100</button>
+                  <input type="range" id="tempo" min="92" max="108" value="100" step="0.5">
+                </div>
               </div>
             </div>
             </div>
 
             <div class="mix-block">
-              <span class="label">EQ</span>
+              <div class="section-head">
+                <span class="label">EQ</span>
+                <button type="button" class="qmark" aria-controls="qhelp-eq" aria-expanded="false" aria-label="?">?</button>
+              </div>
+              <div class="qhelp" id="qhelp-eq" hidden data-i18n="help_eq"></div>
               <div class="eq-row">
                 <button type="button" id="kill-low" class="kill-btn">LOW</button>
                 <input type="range" id="eq-low" min="-26" max="6" value="0" step="1">
@@ -263,6 +296,11 @@
       <!-- LIGHT SHOW — the lead picks a look; every screen becomes a synced
            light. The lead keeps its controls + a small preview swatch. -->
       <div class="ls-block">
+        <div class="section-head">
+          <span class="label" data-i18n="ls_title">LUCI</span>
+          <button type="button" class="qmark" aria-controls="qhelp-lights" aria-expanded="false" aria-label="?">?</button>
+        </div>
+        <div class="qhelp" id="qhelp-lights" hidden data-i18n="help_lights"></div>
         <div class="ls-toggle-row">
           <button type="button" id="btn-lights" class="lights-toggle">LUCI: OFF</button>
           <span class="ls-preview" id="ls-preview" aria-hidden="true"></span>
@@ -318,6 +356,11 @@
 
       <!-- MULTI-ZONE — optional: assign each phone a stereo channel + band + trim. -->
       <div class="mz-block">
+        <div class="section-head">
+          <span class="label" data-i18n="mz_title">MULTI-ZONA</span>
+          <button type="button" class="qmark" aria-controls="qhelp-mz" aria-expanded="false" aria-label="?">?</button>
+        </div>
+        <div class="qhelp" id="qhelp-mz" hidden data-i18n="help_multizone"></div>
         <button type="button" id="btn-multizone" class="lights-toggle">MULTI-ZONA: OFF</button>
         <div id="multizone-controls" class="multizone-controls" hidden>
           <div class="mz-presets">
@@ -334,7 +377,9 @@
         <div class="jukebox-head">
           <button type="button" id="btn-jukebox" class="jukebox-toggle">JUKEBOX: CHIUSO</button>
           <span class="label"><span data-i18n="jb_requests">RICHIESTE</span>: <span id="jukebox-count" class="num">00</span></span>
+          <button type="button" class="qmark" aria-controls="qhelp-jb" aria-expanded="false" aria-label="?">?</button>
         </div>
+        <div class="qhelp" id="qhelp-jb" hidden data-i18n="help_jukebox"></div>
         <span class="dim" id="jukebox-empty" data-i18n="jb_empty"></span>
         <ul class="jukebox-list" id="jukebox-list"></ul>
       </div>
@@ -342,7 +387,9 @@
       <div class="spec-row">
         <button type="button" id="btn-click" class="ghost" data-i18n="click_start">CLICK TRACK</button>
         <span class="dim" id="click-hint" data-i18n="click_hint" hidden></span>
+        <button type="button" class="qmark" aria-controls="qhelp-click" aria-expanded="false" aria-label="?">?</button>
       </div>
+      <div class="qhelp" id="qhelp-click" hidden data-i18n="help_click"></div>
 
       <div class="techline num" id="lead-tech" aria-hidden="true"></div>
       <div class="spec-row">
@@ -395,7 +442,11 @@
           <input type="range" id="vol" min="0" max="100" value="100" step="1">
         </div>
         <div class="slider-row">
-          <label class="label" for="cal"><span data-i18n="calibration">CALIBRAZIONE</span> <span class="num" id="cal-val">+000MS</span></label>
+          <div class="section-head">
+            <label class="label" for="cal"><span data-i18n="calibration">CALIBRAZIONE</span> <span class="num" id="cal-val">+000MS</span></label>
+            <button type="button" class="qmark" aria-controls="qhelp-cal" aria-expanded="false" aria-label="?">?</button>
+          </div>
+          <div class="qhelp" id="qhelp-cal" hidden data-i18n="help_cal"></div>
           <div class="cal-row">
             <button type="button" id="btn-cal-lock" class="cal-lock">SBLOCCA</button>
             <input type="range" id="cal" min="-250" max="250" value="0" step="5" disabled>

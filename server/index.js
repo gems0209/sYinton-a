@@ -787,7 +787,7 @@ const HANDLERS = {
     if (!session.decks.on) return;
     const d = deckOf(session, msg.deck);
     if (!d || typeof msg.rate !== 'number' || !isFinite(msg.rate)) return;
-    const rate = Math.min(S.TEMPO_MAX, Math.max(S.TEMPO_MIN, msg.rate));
+    const rate = Math.min(S.DECK_RATE_MAX, Math.max(S.DECK_RATE_MIN, msg.rate));
     if (rate === d.rate) return;
     let glide = null;
     if (d.status === 'playing') {
@@ -822,9 +822,9 @@ const HANDLERS = {
       return sendError(ws, 'SYNC_UNAVAILABLE', 'NO RELIABLE BPM');
     }
     let ratio = (mO.bpm * o.rate) / mD.bpm; // rate that makes effective BPMs equal
-    while (ratio > 1.5) ratio /= 2;
-    while (ratio < 1 / 1.5) ratio *= 2;
-    if (ratio < S.TEMPO_MIN || ratio > S.TEMPO_MAX) {
+    while (ratio > Math.SQRT2) ratio /= 2;   // fold to the NEAREST octave (min pitch shift)
+    while (ratio < Math.SQRT1_2) ratio *= 2;
+    if (ratio < S.DECK_RATE_MIN || ratio > S.DECK_RATE_MAX) {
       return sendError(ws, 'SYNC_UNAVAILABLE', 'BPM OUT OF PITCH RANGE');
     }
     if (d.status !== 'playing' || o.status !== 'playing') {
@@ -888,11 +888,13 @@ const HANDLERS = {
       master.status = 'playing';
     }
 
-    // Follower rate = octave-folded ratio matching the master's effective BPM.
+    // Follower rate = nearest-octave-folded ratio matching the master's BPM.
+    // Folding to the nearest octave keeps the pitch shift minimal (≤±√2); the
+    // wide deck range means two arbitrary songs lock instead of being refused.
     let ratio = (mMaster.bpm * master.rate) / mFollow.bpm;
-    while (ratio > 1.5) ratio /= 2;
-    while (ratio < 1 / 1.5) ratio *= 2;
-    if (ratio < S.TEMPO_MIN || ratio > S.TEMPO_MAX) {
+    while (ratio > Math.SQRT2) ratio /= 2;
+    while (ratio < Math.SQRT1_2) ratio *= 2;
+    if (ratio < S.DECK_RATE_MIN || ratio > S.DECK_RATE_MAX) {
       return sendError(ws, 'SYNC_UNAVAILABLE', 'BPM OUT OF PITCH RANGE');
     }
 

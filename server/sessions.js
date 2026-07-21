@@ -28,6 +28,12 @@ const NEUTRAL_FX = () => ({ low: 0, mid: 0, high: 0, killLow: false, killMid: fa
 // ---- DUAL DECK constants ----------------------------------------------------
 const DECK_IDS = ['A', 'B'];
 const DECK_PLAY_LEAD_MS = 900;           // deck actions feel snappier than queue PLAY, still sync-safe
+// Decks get a real DJ pitch range, wider than the ±8% master-tempo trim: beat-
+// matching two arbitrary songs means bending one's tempo (and pitch, no time-
+// stretch here) by more than 8%. The beatmatch folds to the NEAREST octave, so
+// the shift stays within ±√2 and in practice well under ±20%.
+const DECK_RATE_MIN = 0.5;               // −50% … +50% deck pitch
+const DECK_RATE_MAX = 1.5;
 const newDeck = () => ({
   trackId: null,
   status: 'empty',      // 'empty' | 'loaded' | 'playing' | 'paused' | 'ended'
@@ -504,6 +510,8 @@ module.exports = {
   TRANSITION_FADE_S,
   DECK_IDS,
   DECK_PLAY_LEAD_MS,
+  DECK_RATE_MIN,
+  DECK_RATE_MAX,
   newDeck,
   LIGHTSHOW_PATTERNS,
   LIGHTSHOW_PALETTES,

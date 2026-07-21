@@ -108,18 +108,23 @@ involved at all.
   track as deck A with the exact same timeline — zero glitch, since clients
   already render the queue on channel A.
 - **Per-deck controls**: PLAY/PAUSE, tap-to-seek on the strip waveform, the
-  track's 4 hot cues, **pitch ±8 %** (server re-anchors, clients glide
-  `playbackRate` — no restart) and **SYNC**: the server sets this deck's rate
-  so the effective BPMs match (octave folding, refused with a soft error
-  outside the pitch range) and phase-aligns the beat grids with a
-  nearest-beat micro-seek (≤ half a beat, rendered as a 60 ms crossfade).
+  track's 4 hot cues, **pitch −50…+50 %** (a real DJ range, wider than the ±8 %
+  master-tempo trim; server re-anchors, clients glide `playbackRate` — no
+  restart) and **SYNC**: the server sets this deck's rate so the effective BPMs
+  match and phase-aligns the beat grids with a nearest-beat micro-seek (≤ half a
+  beat, rendered as a 60 ms crossfade). The ratio is folded to the **nearest
+  octave** (minimal pitch shift, ≤ ±√2), so two arbitrary songs lock instead of
+  being refused for being more than 8 % apart.
 - **SYNC & PLAY** (`deck-beatmatch`): one tap does the whole beatmatch — picks
   a master (a deck already playing, else A), matches the other deck's BPM,
   phase-locks it, **starts whatever isn't playing** and centres the crossfader
   so both are audible. A stopped follower is brought in fresh on the master's
   beat from its own downbeat; a playing one is micro-seeked into phase. It's the
   "put both at the same BPM and play them together" button; the per-deck SYNC
-  above stays for hands-on control.
+  above stays for hands-on control. Works on **any two tracks** (nearest-octave
+  fold keeps the pitch shift small); it only ever declines when a BPM is still
+  analysing or genuinely unreadable, and says exactly which in the user's
+  language.
 - **Crossfader**: −1 = only A, +1 = only B, cos/sin equal-power law, streamed
   like the fx (throttled, applied everywhere at a server-fixed instant ~0.3 s
   ahead; double-tap recenters). The global EQ/filter sits after the mix and
@@ -229,7 +234,7 @@ All session messages carry `sessionCode`; transport messages from satellites are
 | `cue-set` | C→S | `trackId`, `slot` 0-3, `position` (null clears) |
 | `decks-mode` | C→S | `on: bool` (on adopts a playing queue track as deck A) |
 | `deck-load` / `deck-play` / `deck-pause` / `deck-seek` | C→S | `deck: A\|B` + `trackId` / `position` / `force` |
-| `deck-rate` / `deck-sync` | C→S | per-deck pitch 0.92–1.08 / BPM+phase match onto the other deck |
+| `deck-rate` / `deck-sync` | C→S | per-deck pitch 0.5–1.5 / BPM+phase match onto the other deck (nearest-octave fold) |
 | `deck-beatmatch` | C→S | one-tap: match BPM, phase-lock, start both decks, centre the crossfader |
 | `xfader` / `xfader-update` | C→S / S→C | `x: −1..1` ⇄ same + `applyAtServerTime` |
 | `decks-update` | S→C | full decks snapshot (+ `glide` hint on pitch-only changes) |

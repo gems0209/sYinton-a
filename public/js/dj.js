@@ -94,11 +94,14 @@ async function analyzeBuffer(buf) {
   if (oMax > 0) for (let k = 0; k < onset.length; k++) onset[k] /= oMax;
 
   // Coarse: autocorrelation of the onset train over the 70–180 BPM lag range,
-  // with harmonic support so the true tempo beats its own subdivisions.
+  // with octave (2L) support so the true tempo beats its own subdivisions.
+  // NB: no 3L term — it rewards the lag ⅔·Lₚ (its 3× hits a real beat), which
+  // pulls the estimate to 1.5× the true tempo (e.g. 100→150). 2L support is
+  // enough to prefer the beat over its half-time without inviting that alias.
   const Lmin = Math.max(1, Math.floor((60 / 180) / hopSec));
   const Lmax = Math.min(onset.length - 2, Math.ceil((60 / 70) / hopSec));
-  // Extended range so the 2L/3L harmonic support of high BPMs exists too.
-  const LmaxExt = Math.min(onset.length - 2, 3 * Lmax);
+  // Extended range so the 2L harmonic support of high BPMs exists too.
+  const LmaxExt = Math.min(onset.length - 2, 2 * Lmax);
   const ac = new Float32Array(LmaxExt + 1);
   for (let L = Lmin; L <= LmaxExt; L++) {
     let s = 0;
@@ -110,7 +113,7 @@ async function analyzeBuffer(buf) {
   let bestL = Lmin;
   let bestS = -1;
   for (let L = Lmin; L <= Lmax; L++) {
-    const s = ac[L] + 0.5 * acAt(2 * L) + 0.25 * acAt(3 * L);
+    const s = ac[L] + 0.5 * acAt(2 * L);
     if (s > bestS) { bestS = s; bestL = L; }
   }
   const bpmCoarse = 60 / (bestL * hopSec);
@@ -593,10 +596,12 @@ function wireDecks() {
     const a = deckTrackObj('A');
     const b = deckTrackObj('B');
     if (!a || !b) return E.flash(t('bm_need_both'));
-    const hasBpm = (tr) => tr.meta && tr.meta.bpm;
-    if (!hasBpm(a) || !hasBpm(b)) return E.flash(t('bm_need_bpm'));
+    // Match the server's gate exactly (bpm present AND confident enough), so a
+    // click either acts or says precisely why — never a silent no-op.
+    const usable = (tr) => tr.meta && tr.meta.bpm && (tr.meta.confidence || 0) >= 0.2;
+    if (!usable(a) || !usable(b)) return E.flash(t('bm_need_bpm'));
     send({ type: 'deck-beatmatch' });
-    E.flash(t('bm_done'));
+    E.flash(t('bm_syncing')); // honest in-progress; the change (or an error) follows
   });
   wireStrip('A');
   wireStrip('B');

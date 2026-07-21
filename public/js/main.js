@@ -324,7 +324,16 @@ ws.on('error', (msg) => {
   } else if (msg.code === 'NO_TRACK') {
     flash(t('err_no_track'));
   } else if (msg.code === 'SYNC_UNAVAILABLE') {
-    flash(t('err_sync'));
+    // Surface WHY sync couldn't run, in the user's language, instead of a
+    // generic "unavailable" that reads like the button is dead.
+    const reason = {
+      'LOAD BOTH DECKS': 'err_sync_both',
+      'BPM NOT READY': 'err_sync_bpm',
+      'NO RELIABLE BPM': 'err_sync_bpm',
+      'BPM OUT OF PITCH RANGE': 'err_sync_range',
+      'TRACK ENDING': 'err_sync_ending',
+    }[msg.text];
+    flash(t(reason || 'err_sync'));
   } else if (msg.code !== 'NO_SESSION') {
     flash(`ERR: ${msg.text || msg.code}`);
   }

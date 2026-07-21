@@ -600,13 +600,13 @@ function wireDecks() {
     const a = deckTrackObj('A');
     const b = deckTrackObj('B');
     if (!a || !b) return E.flash(t('bm_need_both'));
-    // Match the server's gate exactly (bpm present AND confident enough), so a
-    // click either acts or says precisely why — never a silent no-op.
+    // Always play both decks; only report full beat-match when both BPMs are
+    // confident (the server does the same and plays anyway otherwise).
     const usable = (tr) => tr.meta && tr.meta.bpm && (tr.meta.confidence || 0) >= 0.2;
-    if (!usable(a) || !usable(b)) return E.flash(t('bm_need_bpm'));
+    const matched = usable(a) && usable(b);
     // Arm audio on the gesture, then fire — a suspended context (common in
     // deck mode) would otherwise start nothing on this device.
-    arm(() => { send({ type: 'deck-beatmatch' }); E.flash(t('bm_syncing')); });
+    arm(() => { send({ type: 'deck-beatmatch' }); E.flash(t(matched ? 'bm_syncing' : 'bm_playing_nobpm')); });
   });
   wireStrip('A');
   wireStrip('B');

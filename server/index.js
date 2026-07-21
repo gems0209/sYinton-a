@@ -852,12 +852,13 @@ const HANDLERS = {
     S.broadcastDecks(session); // no glide: the micro-seek is a reschedule
   },
 
-  // One-tap beatmatch: "put both decks at the same BPM and play them together".
-  // Picks a master (a deck already playing, else A), matches the other deck's
-  // BPM, phase-locks it, starts whatever isn't playing and centers the
-  // crossfader so both are audible. Reuses deck-sync's phase math; a follower
-  // that's already playing is micro-seeked into phase, a stopped one is brought
-  // in fresh on the master's beat from its own downbeat.
+  // One-tap "SYNC & PLAY": start BOTH decks together, centre the crossfader, and
+  // beat-match when a reliable BPM exists on both. The "play them together" part
+  // must never be blocked by analysis — if a BPM is missing or low-confidence
+  // (or the tempos are too far even after octave folding), the decks still start,
+  // just without tempo/phase alignment (the user can nudge with PITCH). Picks a
+  // master (a deck already playing, else A); a playing follower is micro-seeked
+  // into phase, a stopped one is brought in fresh on the master's beat.
   'deck-beatmatch'(ws, msg, session, client) {
     if (client.role !== 'lead') return;
     if (!session.decks.on) return;
@@ -868,9 +869,7 @@ const HANDLERS = {
     const tB = S.getTrack(session, B.trackId);
     const mA = tA && tA.meta;
     const mB = tB && tB.meta;
-    if (!mA || !mB || !mA.bpm || !mB.bpm || mA.confidence < 0.2 || mB.confidence < 0.2) {
-      return sendError(ws, 'SYNC_UNAVAILABLE', 'BPM NOT READY');
-    }
+
     // Master = a deck already playing (prefer A); follower = the other one.
     const masterId = A.status === 'playing' ? 'A' : (B.status === 'playing' ? 'B' : 'A');
     const followId = masterId === 'A' ? 'B' : 'A';
@@ -888,41 +887,50 @@ const HANDLERS = {
       master.status = 'playing';
     }
 
-    // Follower rate = nearest-octave-folded ratio matching the master's BPM.
-    // Folding to the nearest octave keeps the pitch shift minimal (≤±√2); the
-    // wide deck range means two arbitrary songs lock instead of being refused.
-    let ratio = (mMaster.bpm * master.rate) / mFollow.bpm;
-    while (ratio > Math.SQRT2) ratio /= 2;
-    while (ratio < Math.SQRT1_2) ratio *= 2;
-    if (ratio < S.DECK_RATE_MIN || ratio > S.DECK_RATE_MAX) {
-      return sendError(ws, 'SYNC_UNAVAILABLE', 'BPM OUT OF PITCH RANGE');
+    // Beat-match only when both tracks carry a confident BPM and the nearest-
+    // octave-folded ratio is in the deck's pitch range; otherwise ratio stays
+    // null and we simply play the follower too.
+    let ratio = null;
+    if (mMaster && mFollow && mMaster.bpm && mFollow.bpm
+      && mMaster.confidence >= 0.2 && mFollow.confidence >= 0.2) {
+      ratio = (mMaster.bpm * master.rate) / mFollow.bpm;
+      while (ratio > Math.SQRT2) ratio /= 2;
+      while (ratio < Math.SQRT1_2) ratio *= 2;
+      if (ratio < S.DECK_RATE_MIN || ratio > S.DECK_RATE_MAX) ratio = null;
     }
 
-    // The master's next beat instant (at or after a shared future apply time).
-    const applyAt = Math.max(now() + S.FX_APPLY_LEAD_MS, master.startAtServerTime);
-    const posM = S.timelinePositionAt(master, applyAt);
-    const bM = 60 / mMaster.bpm;
-    const kM = Math.ceil((posM - (mMaster.beatPhase || 0)) / bM - 1e-6);
-    const tBeat = applyAt + (((mMaster.beatPhase || 0) + kM * bM - posM) / master.rate) * 1000;
-
-    follow.rate = ratio;
-    if (follow.status === 'playing') {
-      // Already playing: nearest-beat micro-seek at its current position.
-      const posF = S.timelinePositionAt(follow, applyAt);
-      const posFAtBeat = posF + ((tBeat - applyAt) / 1000) * ratio;
-      const bF = 60 / mFollow.bpm;
-      const mBeat = Math.round((posFAtBeat - (mFollow.beatPhase || 0)) / bF);
-      let from = posF + (((mFollow.beatPhase || 0) + mBeat * bF) - posFAtBeat);
-      if (from < 0) from += bF;
-      if (tFollow.duration && from > tFollow.duration - 0.1) from = mFollow.beatPhase || 0;
-      follow.trackOffset = from;
-      follow.startAtServerTime = applyAt;
-    } else {
-      // Bring it in fresh: start on the master's beat from its own downbeat.
-      let from = mFollow.beatPhase || 0;
-      if (tFollow.duration && from >= tFollow.duration) from = 0;
-      follow.trackOffset = from;
-      follow.startAtServerTime = tBeat;
+    if (ratio != null) {
+      // The master's next beat instant (at or after a shared future apply time).
+      const applyAt = Math.max(now() + S.FX_APPLY_LEAD_MS, master.startAtServerTime);
+      const posM = S.timelinePositionAt(master, applyAt);
+      const bM = 60 / mMaster.bpm;
+      const kM = Math.ceil((posM - (mMaster.beatPhase || 0)) / bM - 1e-6);
+      const tBeat = applyAt + (((mMaster.beatPhase || 0) + kM * bM - posM) / master.rate) * 1000;
+      follow.rate = ratio;
+      if (follow.status === 'playing') {
+        // Already playing: nearest-beat micro-seek at its current position.
+        const posF = S.timelinePositionAt(follow, applyAt);
+        const posFAtBeat = posF + ((tBeat - applyAt) / 1000) * ratio;
+        const bF = 60 / mFollow.bpm;
+        const mBeat = Math.round((posFAtBeat - (mFollow.beatPhase || 0)) / bF);
+        let from = posF + (((mFollow.beatPhase || 0) + mBeat * bF) - posFAtBeat);
+        if (from < 0) from += bF;
+        if (tFollow.duration && from > tFollow.duration - 0.1) from = mFollow.beatPhase || 0;
+        follow.trackOffset = from;
+        follow.startAtServerTime = applyAt;
+      } else {
+        // Bring it in fresh: start on the master's beat from its own downbeat.
+        let from = mFollow.beatPhase || 0;
+        if (tFollow.duration && from >= tFollow.duration) from = 0;
+        follow.trackOffset = from;
+        follow.startAtServerTime = tBeat;
+        follow.pausedPosition = 0;
+        follow.status = 'playing';
+      }
+    } else if (follow.status !== 'playing') {
+      // No reliable BPM (or tempos too far): just play the follower too, as-is.
+      follow.trackOffset = follow.pausedPosition || 0;
+      follow.startAtServerTime = now() + S.DECK_PLAY_LEAD_MS;
       follow.pausedPosition = 0;
       follow.status = 'playing';
     }
